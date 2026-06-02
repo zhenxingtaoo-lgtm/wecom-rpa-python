@@ -1,0 +1,79 @@
+# 企业微信 RPA 示例配置
+
+# 本次最多实际处理多少个目标群，必须 > 0
+max_total_send: 100
+
+# 企业微信限制：每次最多 9 个会话
+batch_size: 9
+
+# 批次之间等待秒数，降低风控和误操作风险
+batch_interval_sec: 5
+
+# 单个群搜索/选择失败后的重试次数
+max_retry_per_group: 2
+
+# 收件人选择策略
+# bottom_of_picker = 在“选择聊天/发送给”弹窗里滚到底部，连续勾选底部最多 9 个会话。
+# search_by_name = 旧方案，按群名逐个搜索。
+recipient_selection:
+  mode: bottom_of_picker
+  # 用户确认：底部出现员工、机器人也没关系，所以不做客户群类型过滤。
+  allow_staff_and_bots: true
+  # 每次打开选择聊天弹窗后滚到底部的尝试次数。
+  scroll_to_bottom_repeats: 5
+  # 从下往上选择候选会话；遇到结束哨兵时，只发送哨兵下面的群聊。
+  selection_direction: bottom_to_top
+  sentinel:
+    enabled: false
+    # 3 个员工私聊作为结束边界；哨兵本身不发送。
+    # 注意：哨兵名称不要包含“外部”“全员”字样，OCR 识别时会自动去除这些标记。
+    names: []
+    # true = 一旦左侧已勾选候选列表无法解析/无法截断，就停止并截图，不继续真实发送。
+    stop_on_detection_failure: true
+    # 兼容旧右侧截断方案的配置项；当前哨兵截断优先点击左侧复选框取消勾选。
+    remove_button_x_ratio: 0.940
+    # 兼容旧右侧 OCR 方案的配置项；当前哨兵识别优先读取左侧候选列表。
+    selected_list_region_ratio: [0.670, 0.220, 0.285, 0.760]
+    # 兼容旧右侧 OCR 方案的配置项。
+    selected_item_row_height_ratio: 0.075
+
+# 源消息重选策略
+# 用户第一次手动选好待转发消息；后续批次重新进入多选后，只点击左侧复选框列，
+# 避免误点消息正文、链接或卡片。
+source_selection:
+  checkbox_x_ratio: 0.322
+  checkbox_y_ratios: [0.547, 0.790]
+  forward_button_ratio: [0.478, 0.901]
+
+# 急停快捷键
+stop_hotkey: ctrl+alt+q
+
+# true = 试运行，不点击最终发送按钮
+# 第一阶段开发和校准模板时必须先用 true
+dry_run: true
+
+# 开始前要求人工确认消息已正确选中
+require_confirm_before_start: true
+
+# 第一批发送前再确认一次
+require_confirm_first_batch: true
+
+# 窗口与坐标策略
+window:
+  title_keyword: 企业微信
+  use_relative_coordinates: true
+  # 后续在 Windows 机器校准后填写。坐标为相对窗口比例，不是绝对像素。
+  # anchors:
+  #   search_box: {x_ratio: 0.50, y_ratio: 0.18}
+  #   send_button: [0.90, 0.92]
+  anchors: {}
+
+# OCR 设置，后续实现时再细化
+ocr:
+  engine: paddleocr
+  lang: ch
+  fallback: windows
+
+# 模板匹配阈值
+vision:
+  template_threshold: 0.86

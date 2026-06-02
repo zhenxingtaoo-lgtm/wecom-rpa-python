@@ -1,0 +1,41 @@
+# 一次性真实发送配置：启用“大小尘”作为哨兵边界。
+max_total_send: 9
+batch_size: 9
+batch_interval_sec: 0
+max_retry_per_group: 2
+
+recipient_selection:
+  mode: bottom_of_picker
+  allow_staff_and_bots: true
+  scroll_to_bottom_repeats: 5
+  selection_direction: bottom_to_top
+  sentinel:
+    enabled: true
+    names: ["大小尘"]
+    stop_on_detection_failure: true
+    remove_button_x_ratio: 0.940
+    selected_list_region_ratio: [0.670, 0.220, 0.285, 0.760]
+    selected_item_row_height_ratio: 0.075
+
+source_selection:
+  checkbox_x_ratio: 0.322
+  checkbox_y_ratios: [0.547, 0.790]
+  forward_button_ratio: [0.478, 0.901]
+
+stop_hotkey: ctrl+alt+q
+dry_run: false
+require_confirm_before_start: false
+require_confirm_first_batch: false
+
+window:
+  title_keyword: 企业微信
+  use_relative_coordinates: true
+  anchors: {}
+
+ocr:
+  engine: paddleocr
+  lang: ch
+  fallback: windows
+
+vision:
+  template_threshold: 0.86

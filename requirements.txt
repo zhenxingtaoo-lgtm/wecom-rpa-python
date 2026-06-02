@@ -1,0 +1,12 @@
+PyYAML>=6.0
+
+# Windows 实机校准/运行时可选依赖（Linux/CI dry-run 不强制安装）
+# pip install -e .[windows]
+# keyboard>=0.13.5
+# mss>=9.0.1
+# opencv-python>=4.8
+# paddleocr>=2.7
+# Pillow>=10.0
+# PyGetWindow>=0.0.9
+# pyautogui>=0.9.54
+# pytesseract>=0.3.10

@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wecom-rpa"
+version = "0.1.0"
+description = "企业微信桌面端批量转发 RPA 第一版安全 dry-run 骨架"
+requires-python = ">=3.11"
+dependencies = [
+  "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+test = []
+windows = [
+  "keyboard>=0.13.5",
+  "mss>=9.0.1",
+  "opencv-python>=4.8",
+  "Pillow>=10.0",
+  "paddleocr>=2.7",
+  "PyGetWindow>=0.0.9",
+  "pyautogui>=0.9.54",
+  "pytesseract>=0.3.10",
+]
+
+[project.scripts]
+wecom-rpa = "wecom_rpa.main:main"
+wecom-rpa-calibrate = "wecom_rpa.calibration:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,561 @@
+from __future__ import annotations
+
+import logging
+import json
+import shutil
+import subprocess
+import tempfile
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+log = logging.getLogger(__name__)
+
+
+def _decode_process_output(data: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-16", "gbk"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def _windows_path(path: Path) -> str:
+    wslpath = shutil.which("wslpath")
+    if not wslpath:
+        return str(path)
+    converted = subprocess.run([wslpath, "-w", str(path)], check=False, capture_output=True, text=True)
+    return converted.stdout.strip() if converted.returncode == 0 else str(path)
+
+
+def _powershell_exe() -> Path | None:
+    native = shutil.which("powershell.exe") or shutil.which("powershell")
+    if native:
+        return Path(native)
+    wsl_path = Path("/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")
+    return wsl_path if wsl_path.exists() else None
+
+
+@dataclass(frozen=True)
+class Region:
+    left: int
+    top: int
+    width: int
+    height: int
+
+    def as_tuple(self) -> tuple[int, int, int, int]:
+        return (self.left, self.top, self.width, self.height)
+
+
+@dataclass(frozen=True)
+class TemplateMatch:
+    template_name: str
+    confidence: float
+    left: int
+    top: int
+    width: int
+    height: int
+
+    @property
+    def center(self) -> tuple[int, int]:
+        return (self.left + self.width // 2, self.top + self.height // 2)
+
+
+@dataclass(frozen=True)
+class OcrLine:
+    text: str
+    left: int
+    top: int
+    width: int
+    height: int
+    confidence: float | None = None
+
+    @property
+    def center_y(self) -> int:
+        return self.top + self.height // 2
+
+
+class ScreenInspector:
+    """截图 / 模板匹配 / OCR 封装。
+
+    设计为“能实机就实机，缺依赖就安全降级”：在非 Windows/无 GUI/未安装
+    mss、Pillow、opencv 时，不做点击，不抛出环境类异常，而是写占位文件，
+    便于 CI 和 dry-run 测试继续运行。
+    """
+
+    def __init__(
+        self,
+        screenshot_dir: str | Path = "screenshots",
+        *,
+        template_dir: str | Path = "templates",
+        template_threshold: float = 0.86,
+        ocr_engine: str = "paddleocr",
+        ocr_lang: str = "ch",
+        ocr_fallback: str = "windows",
+    ):
+        self.screenshot_dir = Path(screenshot_dir)
+        self.template_dir = Path(template_dir)
+        self.template_threshold = template_threshold
+        self.ocr_engine = ocr_engine
+        self.ocr_lang = ocr_lang
+        self.ocr_fallback = ocr_fallback
+        (self.screenshot_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
+        (self.screenshot_dir / "errors").mkdir(parents=True, exist_ok=True)
+
+    def save_checkpoint(self, name: str, region: Region | None = None) -> Path:
+        return self._save_capture("checkpoints", name, region=region)
+
+    def save_error(self, name: str, reason: str, region: Region | None = None) -> Path:
+        path = self._save_capture("errors", name, region=region, fallback_text=f"错误截图占位：{reason}\n")
+        log.error("保存错误截图：%s reason=%s", path, reason)
+        return path
+
+    def capture(self, path: str | Path, region: Region | None = None) -> Path:
+        """保存屏幕截图；失败时写 .placeholder.txt 并返回该路径。"""
+        requested = Path(path)
+        requested.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self._capture_png(requested, region)
+            log.info("保存截图：%s", requested)
+            return requested
+        except Exception as exc:  # 环境缺 GUI/依赖时安全降级
+            fallback = requested.with_suffix(".placeholder.txt")
+            fallback.write_text(f"截图占位：当前环境无法保存 PNG。原因：{exc}\n", encoding="utf-8")
+            log.warning("截图不可用，已保存占位文件：%s (%s)", fallback, exc)
+            return fallback
+
+    def find_template(
+        self,
+        template_name: str,
+        *,
+        image_path: str | Path | None = None,
+        region: Region | None = None,
+        threshold: float | None = None,
+    ) -> TemplateMatch | None:
+        """在截图中查找模板，返回最佳匹配；缺依赖/模板不存在时返回 None。"""
+        threshold = self.template_threshold if threshold is None else threshold
+        template_path = self.template_dir / template_name
+        if not template_path.exists():
+            log.debug("模板不存在：%s", template_path)
+            return None
+
+        captured_tmp: Path | None = None
+        if image_path is None:
+            captured_tmp = self.capture(self.screenshot_dir / "checkpoints" / "template_scan.png", region=region)
+            image_path = captured_tmp
+        image_path = Path(image_path)
+        if image_path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".bmp"}:
+            return None
+
+        try:
+            import cv2  # type: ignore
+        except Exception as exc:
+            log.debug("OpenCV 不可用，跳过模板识别：%s", exc)
+            return None
+
+        haystack = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+        needle = cv2.imread(str(template_path), cv2.IMREAD_COLOR)
+        if haystack is None or needle is None:
+            return None
+        if haystack.shape[0] < needle.shape[0] or haystack.shape[1] < needle.shape[1]:
+            return None
+
+        result = cv2.matchTemplate(haystack, needle, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+        if float(max_val) < threshold:
+            log.debug("模板匹配未达阈值：%s confidence=%.3f threshold=%.3f", template_name, max_val, threshold)
+            return None
+        left, top = int(max_loc[0]), int(max_loc[1])
+        match = TemplateMatch(template_name, float(max_val), left, top, int(needle.shape[1]), int(needle.shape[0]))
+        log.info("模板匹配成功：%s confidence=%.3f center=%s", template_name, match.confidence, match.center)
+        return match
+
+    def ocr_text(self, region: Region | None = None, image_path: str | Path | None = None) -> str:
+        """OCR 占位/轻量封装。当前不强制引入 OCR 依赖，实机阶段再接入。"""
+        log.debug("OCR 尚未接入，region=%s image_path=%s", region, image_path)
+        return ""
+
+    def ocr_lines(self, region: Region | None = None, image_path: str | Path | None = None) -> list[OcrLine]:
+        """返回 OCR 文本行。
+
+        运行时按配置选择 OCR 后端；PaddleOCR/Tesseract 不可用时可回退 Windows OCR。
+        """
+        captured_tmp: Path | None = None
+        if image_path is None:
+            captured_tmp = self.capture(self.screenshot_dir / "checkpoints" / "ocr_scan.png", region=region)
+            image_path = captured_tmp
+        image = Path(image_path)
+        if image.suffix.lower() not in {".png", ".jpg", ".jpeg", ".bmp"}:
+            return []
+
+        if self.ocr_engine == "none":
+            return []
+        if self.ocr_engine == "windows":
+            return self._ocr_lines_via_windows_ocr(image)
+        if self.ocr_engine == "paddleocr":
+            lines = self._ocr_lines_via_paddleocr(image)
+            if lines or self.ocr_fallback == "none":
+                return lines
+            log.info("PaddleOCR 不可用或未识别到文本，尝试 Windows OCR")
+            return self._ocr_lines_via_windows_ocr(image)
+
+        try:
+            from PIL import Image  # type: ignore
+            import pytesseract  # type: ignore
+        except Exception as exc:
+            log.info("Python OCR 依赖不可用，尝试 Windows OCR：%s", exc)
+            return self._ocr_lines_via_windows_ocr(image) if self.ocr_fallback == "windows" else []
+
+        try:
+            data = pytesseract.image_to_data(Image.open(image), lang="chi_sim+eng", output_type=pytesseract.Output.DICT)
+        except Exception as exc:
+            log.warning("Python OCR 识别失败，尝试 Windows OCR：%s", exc)
+            return self._ocr_lines_via_windows_ocr(image) if self.ocr_fallback == "windows" else []
+
+        grouped: dict[tuple[int, int, int], list[int]] = {}
+        for index, text in enumerate(data.get("text", [])):
+            text = str(text).strip()
+            if not text:
+                continue
+            key = (
+                int(data.get("block_num", [0])[index]),
+                int(data.get("par_num", [0])[index]),
+                int(data.get("line_num", [0])[index]),
+            )
+            grouped.setdefault(key, []).append(index)
+
+        lines: list[OcrLine] = []
+        for indexes in grouped.values():
+            texts = [str(data["text"][i]).strip() for i in indexes if str(data["text"][i]).strip()]
+            if not texts:
+                continue
+            left = min(int(data["left"][i]) for i in indexes)
+            top = min(int(data["top"][i]) for i in indexes)
+            right = max(int(data["left"][i]) + int(data["width"][i]) for i in indexes)
+            bottom = max(int(data["top"][i]) + int(data["height"][i]) for i in indexes)
+            confidences = []
+            for i in indexes:
+                try:
+                    conf = float(data["conf"][i])
+                except (TypeError, ValueError):
+                    continue
+                if conf >= 0:
+                    confidences.append(conf)
+            confidence = sum(confidences) / len(confidences) if confidences else None
+            lines.append(OcrLine(" ".join(texts), left, top, right - left, bottom - top, confidence))
+        return sorted(lines, key=lambda line: line.top)
+
+    def _ocr_lines_via_paddleocr(self, image_path: Path) -> list[OcrLine]:
+        try:
+            from paddleocr import PaddleOCR  # type: ignore
+        except Exception as exc:
+            log.info("PaddleOCR 依赖不可用：%s", exc)
+            return []
+        try:
+            ocr = PaddleOCR(lang=self.ocr_lang, use_textline_orientation=True)
+        except TypeError:
+            ocr = PaddleOCR(lang=self.ocr_lang)
+        try:
+            if hasattr(ocr, "predict"):
+                raw = ocr.predict(str(image_path))
+            else:
+                raw = ocr.ocr(str(image_path), cls=True)
+        except Exception as exc:
+            log.warning("PaddleOCR 识别失败：%s", exc)
+            return []
+        return self._parse_paddleocr_result(raw)
+
+    def _parse_paddleocr_result(self, raw: Any) -> list[OcrLine]:
+        items: list[Any] = []
+        if not raw:
+            return []
+        if isinstance(raw, list) and len(raw) == 1 and isinstance(raw[0], list):
+            items = raw[0]
+        elif isinstance(raw, list):
+            items = raw
+        lines: list[OcrLine] = []
+        for item in items:
+            try:
+                box = item[0]
+                payload = item[1]
+                text = str(payload[0]).strip()
+                confidence = float(payload[1]) if len(payload) > 1 else None
+            except (IndexError, TypeError, ValueError):
+                continue
+            if not text or not box:
+                continue
+            xs = [float(point[0]) for point in box]
+            ys = [float(point[1]) for point in box]
+            left = int(min(xs))
+            top = int(min(ys))
+            right = int(max(xs))
+            bottom = int(max(ys))
+            lines.append(OcrLine(text, left, top, right - left, bottom - top, confidence))
+        return sorted(lines, key=lambda line: line.top)
+
+    def _ocr_lines_via_windows_ocr(self, image_path: Path) -> list[OcrLine]:
+        powershell = _powershell_exe()
+        if powershell is None:
+            return []
+        script = r"""
+param([string]$ImagePath)
+[Console]::OutputEncoding=[System.Text.Encoding]::UTF8
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$null = [Windows.Storage.StorageFile, Windows.Storage, ContentType=WindowsRuntime]
+$null = [Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics.Imaging, ContentType=WindowsRuntime]
+$null = [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType=WindowsRuntime]
+$null = [Windows.Globalization.Language, Windows.Globalization, ContentType=WindowsRuntime]
+function Await($WinRtTask, $ResultType) {
+  $asTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.IsGenericMethod })[0]
+  $netTask = $asTask.MakeGenericMethod($ResultType).Invoke($null, @($WinRtTask))
+  $netTask.Wait(-1) | Out-Null
+  $netTask.Result
+}
+$file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($ImagePath)) ([Windows.Storage.StorageFile])
+$stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
+$decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
+$bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+$lang = New-Object Windows.Globalization.Language 'zh-Hans-CN'
+$engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage($lang)
+if (-not $engine) { exit 3 }
+$result = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
+$items = New-Object System.Collections.Generic.List[object]
+foreach ($line in $result.Lines) {
+  $left = 1000000; $top = 1000000; $right = 0; $bottom = 0
+  foreach ($word in $line.Words) {
+    $r = $word.BoundingRect
+    if ($r.X -lt $left) { $left = $r.X }
+    if ($r.Y -lt $top) { $top = $r.Y }
+    if (($r.X + $r.Width) -gt $right) { $right = $r.X + $r.Width }
+    if (($r.Y + $r.Height) -gt $bottom) { $bottom = $r.Y + $r.Height }
+  }
+  if ($left -eq 1000000) { $left = 0; $top = 0 }
+  $items.Add([PSCustomObject]@{
+    Text=$line.Text
+    Left=[int]$left
+    Top=[int]$top
+    Width=[int]($right-$left)
+    Height=[int]($bottom-$top)
+  }) | Out-Null
+}
+$items | ConvertTo-Json -Compress
+""".strip()
+        with tempfile.NamedTemporaryFile("w", suffix=".ps1", encoding="utf-8-sig", dir=Path(tempfile.gettempdir()), delete=False) as f:
+            f.write(script)
+            script_path = Path(f.name)
+        try:
+            result = subprocess.run(
+                [str(powershell), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", _windows_path(script_path), "-ImagePath", _windows_path(image_path)],
+                check=False,
+                capture_output=True,
+                timeout=30,
+            )
+            if result.returncode != 0 or not result.stdout.strip():
+                log.warning("Windows OCR 失败：%s", _decode_process_output(result.stderr).strip())
+                return []
+            raw = json.loads(_decode_process_output(result.stdout))
+            if isinstance(raw, dict):
+                raw = [raw]
+            return [
+                OcrLine(
+                    text=str(item.get("Text", "")),
+                    left=int(item.get("Left", 0)),
+                    top=int(item.get("Top", 0)),
+                    width=int(item.get("Width", 0)),
+                    height=int(item.get("Height", 0)),
+                )
+                for item in raw
+                if str(item.get("Text", "")).strip()
+            ]
+        except Exception as exc:
+            log.warning("Windows OCR 异常：%s", exc)
+            return []
+        finally:
+            try:
+                script_path.unlink()
+            except OSError:
+                pass
+
+    def find_selected_checkbox_ratios(self, image_path: str | Path) -> list[tuple[float, float]]:
+        """识别当前窗口截图里已选源消息的蓝色复选框中心点比例。
+
+        不依赖 Python 图像库；Windows 实机上通过 System.Drawing 扫描蓝色小方块。
+        """
+        image = Path(image_path)
+        if not image.exists() or image.suffix.lower() != ".png":
+            return []
+        powershell = _powershell_exe()
+        if powershell is None:
+            return []
+        script = """
+param([string]$ImagePath)
+Add-Type -AssemblyName System.Drawing
+[Console]::OutputEncoding=[System.Text.Encoding]::UTF8
+$img = [System.Drawing.Bitmap]::FromFile($ImagePath)
+$w = $img.Width
+$h = $img.Height
+$visited = New-Object 'bool[,]' $w,$h
+$boxes = New-Object System.Collections.Generic.List[object]
+for ($y = [int]($h * 0.05); $y -lt $h; $y++) {
+  for ($x = [int]($w * 0.12); $x -lt [int]($w * 0.95); $x++) {
+    if ($visited[$x,$y]) { continue }
+    $c = $img.GetPixel($x, $y)
+    $isBlue = ($c.B -gt 170 -and $c.G -gt 90 -and $c.G -lt 180 -and $c.R -lt 90)
+    if (-not $isBlue) { $visited[$x,$y] = $true; continue }
+    $queue = New-Object System.Collections.Queue
+    $queue.Enqueue(@($x,$y))
+    $visited[$x,$y] = $true
+    $minX=$x; $maxX=$x; $minY=$y; $maxY=$y; $count=0
+    while ($queue.Count -gt 0) {
+      $p = $queue.Dequeue()
+      $px = [int]$p[0]; $py = [int]$p[1]
+      $count++
+      if ($px -lt $minX) { $minX = $px }; if ($px -gt $maxX) { $maxX = $px }
+      if ($py -lt $minY) { $minY = $py }; if ($py -gt $maxY) { $maxY = $py }
+      foreach ($d in @(@(1,0),@(-1,0),@(0,1),@(0,-1))) {
+        $nx = $px + [int]$d[0]; $ny = $py + [int]$d[1]
+        if ($nx -lt 0 -or $ny -lt 0 -or $nx -ge $w -or $ny -ge $h -or $visited[$nx,$ny]) { continue }
+        $nc = $img.GetPixel($nx, $ny)
+        $nb = ($nc.B -gt 170 -and $nc.G -gt 90 -and $nc.G -lt 180 -and $nc.R -lt 90)
+        $visited[$nx,$ny] = $true
+        if ($nb) { $queue.Enqueue(@($nx,$ny)) }
+      }
+    }
+    $bw = $maxX - $minX + 1
+    $bh = $maxY - $minY + 1
+    if ($count -ge 40 -and $bw -ge 8 -and $bw -le 28 -and $bh -ge 8 -and $bh -le 28 -and [Math]::Abs($bw - $bh) -le 8) {
+      $boxes.Add([PSCustomObject]@{ XR=(($minX+$maxX)/2.0)/$w; YR=(($minY+$maxY)/2.0)/$h; W=$bw; H=$bh; Count=$count }) | Out-Null
+    }
+  }
+}
+$img.Dispose()
+$boxes | Sort-Object Y | ConvertTo-Json -Compress
+""".strip()
+        with tempfile.NamedTemporaryFile("w", suffix=".ps1", encoding="utf-8-sig", dir=Path(tempfile.gettempdir()), delete=False) as f:
+            f.write(script)
+            script_path = Path(f.name)
+        try:
+            result = subprocess.run(
+                [str(powershell), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", _windows_path(script_path), "-ImagePath", _windows_path(image)],
+                check=False,
+                capture_output=True,
+                timeout=30,
+            )
+            if result.returncode != 0 or not result.stdout.strip():
+                log.warning("源消息复选框识别失败：%s", _decode_process_output(result.stderr).strip())
+                return []
+            raw = json.loads(_decode_process_output(result.stdout))
+            if isinstance(raw, dict):
+                raw = [raw]
+            points = [(float(item["XR"]), float(item["YR"])) for item in raw]
+            return points
+        except Exception as exc:
+            log.warning("源消息复选框识别异常：%s", exc)
+            return []
+        finally:
+            try:
+                script_path.unlink()
+            except OSError:
+                pass
+
+    def _save_capture(self, subdir: str, name: str, *, region: Region | None = None, fallback_text: str | None = None) -> Path:
+        safe_name = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in name).strip("_") or "capture"
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        target = self.screenshot_dir / subdir / f"{safe_name}_{stamp}.png"
+        path = self.capture(target, region=region)
+        if fallback_text and path.suffix == ".txt":
+            path.write_text(fallback_text, encoding="utf-8")
+        return path
+
+    def _capture_png(self, path: Path, region: Region | None) -> None:
+        try:
+            import mss  # type: ignore
+            from PIL import Image  # type: ignore
+        except Exception as mss_exc:
+            try:
+                # pyautogui 在部分 Windows 环境更容易工作，作为备用。
+                import pyautogui  # type: ignore
+
+                if region is None:
+                    image = pyautogui.screenshot()
+                else:
+                    image = pyautogui.screenshot(region=region.as_tuple())
+                image.save(path)
+                return
+            except Exception as pyautogui_exc:
+                if self._capture_png_via_powershell(path, region):
+                    return
+                raise RuntimeError(f"截图依赖不可用：mss={mss_exc}; pyautogui={pyautogui_exc}")
+
+        with mss.mss() as sct:
+            monitor: dict[str, int]
+            if region is None:
+                monitor = dict(sct.monitors[1])
+            else:
+                monitor = {"left": region.left, "top": region.top, "width": region.width, "height": region.height}
+            raw = sct.grab(monitor)
+            image = Image.frombytes("RGB", raw.size, raw.rgb)
+            image.save(path)
+
+    def _capture_png_via_powershell(self, path: Path, region: Region | None) -> bool:
+        powershell = _powershell_exe()
+        if powershell is None:
+            return False
+        wslpath = shutil.which("wslpath")
+        out_path = str(path)
+        if wslpath:
+            converted = subprocess.run([wslpath, "-w", str(path)], check=False, capture_output=True, text=True)
+            if converted.returncode == 0:
+                out_path = converted.stdout.strip()
+        left = 0 if region is None else region.left
+        top = 0 if region is None else region.top
+        width = 0 if region is None else region.width
+        height = 0 if region is None else region.height
+        script = """
+param([string]$OutPath, [int]$Left, [int]$Top, [int]$Width, [int]$Height)
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+if ($Width -le 0 -or $Height -le 0) {
+  $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+  $Left = $bounds.Left; $Top = $bounds.Top; $Width = $bounds.Width; $Height = $bounds.Height
+}
+$bmp = New-Object System.Drawing.Bitmap $Width, $Height
+$g = [System.Drawing.Graphics]::FromImage($bmp)
+$g.CopyFromScreen($Left, $Top, 0, 0, (New-Object System.Drawing.Size $Width, $Height))
+$bmp.Save($OutPath, [System.Drawing.Imaging.ImageFormat]::Png)
+$g.Dispose(); $bmp.Dispose()
+""".strip()
+        with tempfile.NamedTemporaryFile("w", suffix=".ps1", encoding="utf-8-sig", dir=Path(tempfile.gettempdir()), delete=False) as f:
+            f.write(script)
+            script_path = Path(f.name)
+        try:
+            cmd = [
+                str(powershell),
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                _windows_path(script_path),
+                "-OutPath",
+                out_path,
+                "-Left",
+                str(left),
+                "-Top",
+                str(top),
+                "-Width",
+                str(width),
+                "-Height",
+                str(height),
+            ]
+            result = subprocess.run(cmd, check=False, capture_output=True, timeout=20)
+            if result.returncode != 0:
+                log.debug("PowerShell 截图失败：%s %s", _decode_process_output(result.stdout), _decode_process_output(result.stderr))
+                return False
+            return path.exists()
+        finally:
+            try:
+                script_path.unlink()
+            except OSError:
+                pass
