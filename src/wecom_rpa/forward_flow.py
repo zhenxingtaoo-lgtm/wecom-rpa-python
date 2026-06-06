@@ -56,6 +56,7 @@ class ForwardFlow:
             ocr_engine=config.ocr.engine,
             ocr_lang=config.ocr.lang,
             ocr_fallback=config.ocr.fallback,
+            paddle_model_root=config.ocr.model_root,
         )
         self.window = WeComWindow(config.window.title_keyword, anchors=config.window.anchors)
         self.source_checkbox_x_ratio = config.source_selection.checkbox_x_ratio

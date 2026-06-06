@@ -36,6 +36,7 @@ ocr:
   engine: paddleocr
   lang: ch
   fallback: windows
+  model_root: models/paddleocr
 
 vision:
   template_threshold: 0.86

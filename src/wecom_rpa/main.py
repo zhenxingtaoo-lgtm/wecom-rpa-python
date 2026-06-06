@@ -8,6 +8,7 @@ from pathlib import Path
 from .config import load_config
 from .forward_flow import ForwardFlow
 from .groups import limit_groups, load_groups_csv
+from .screen import ScreenInspector
 from .storage import StateStore
 
 
@@ -36,6 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="真实发送二次确认开关，必须和 --real-send 同时使用",
     )
+    parser.add_argument("--check-ocr-models", action="store_true", help="只检查 PaddleOCR 离线模型和依赖是否可初始化")
     return parser
 
 
@@ -46,6 +48,24 @@ def main(argv: list[str] | None = None) -> int:
     try:
         allow_real_send = bool(args.real_send and args.i_understand_this_will_send_messages)
         config = load_config(args.config, force_dry_run=args.dry_run, allow_real_send=allow_real_send)
+        if args.check_ocr_models:
+            inspector = ScreenInspector(
+                args.screenshot_dir,
+                template_threshold=config.vision.template_threshold,
+                ocr_engine=config.ocr.engine,
+                ocr_lang=config.ocr.lang,
+                ocr_fallback=config.ocr.fallback,
+                paddle_model_root=config.ocr.model_root,
+            )
+            kwargs = inspector._paddleocr_kwargs()
+            from paddleocr import PaddleOCR  # type: ignore
+
+            try:
+                PaddleOCR(lang=config.ocr.lang, use_textline_orientation=True, **kwargs)
+            except TypeError:
+                PaddleOCR(lang=config.ocr.lang, **kwargs)
+            print(f"ocr_status=ok model_dirs={kwargs}")
+            return 0
         groups = load_groups_csv(args.groups)
         limited = limit_groups(groups, config.max_total_send)
         log.info("读取群列表：原始=%s，去重/限额后=%s，batch_size=%s", len(groups), len(limited), config.batch_size)

@@ -100,6 +100,13 @@ class SafetyWindowScreenTest(unittest.TestCase):
         self.assertEqual(calls, ["windows"])
         self.assertEqual(lines, [OcrLine("fallback", 1, 2, 3, 4)])
 
+    def test_configured_paddle_model_root_requires_offline_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            inspector = ScreenInspector("screenshots", paddle_model_root=Path(d) / "models" / "paddleocr")
+
+            with self.assertRaisesRegex(FileNotFoundError, "离线模型不完整"):
+                inspector._paddleocr_kwargs()
+
 
 if __name__ == "__main__":
     unittest.main()

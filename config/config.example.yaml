@@ -73,6 +73,7 @@ ocr:
   engine: paddleocr
   lang: ch
   fallback: windows
+  model_root: models/paddleocr
 
 # 模板匹配阈值
 vision:

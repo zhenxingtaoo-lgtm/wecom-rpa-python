@@ -19,6 +19,7 @@ class OcrConfig:
     engine: str = "paddleocr"
     lang: str = "ch"
     fallback: str = "windows"
+    model_root: str | None = None
 
 
 @dataclass(frozen=True)

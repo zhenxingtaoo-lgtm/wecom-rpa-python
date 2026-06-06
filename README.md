@@ -109,9 +109,26 @@ ocr:
   engine: paddleocr
   lang: ch
   fallback: windows
+  model_root: models/paddleocr
 ```
 
-`paddleocr` 用于中文会话名识别；依赖不可用、模型未就绪或识别失败时，`fallback: windows` 会尝试 Windows OCR。首次使用 PaddleOCR 可能需要下载模型，耗时会比 Windows OCR 更长。
+`paddleocr` 用于中文会话名识别；打包版会随程序携带离线模型目录 `models/paddleocr`，不会要求客户电脑联网下载模型。依赖不可用、模型未就绪或识别失败时，`fallback: windows` 会尝试 Windows OCR。
+
+## Windows 打包
+
+打包目标是 Windows 10/11 x64 普通办公电脑。构建机需要先准备 `.venv-paddle-win`，并确保本机已有 PaddleOCR 模型缓存 `%USERPROFILE%\.paddleocr\whl`。
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\build_release.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\check_release.ps1
+```
+
+输出目录：
+
+- `build\WeComRPA\`：可直接运行的完整目录。
+- `build\WeComRPA.zip`：发给客户测试的压缩包。
+
+客户电脑只需要解压整个目录，先运行 `check-ocr-models.bat` 验证离线 OCR 模型，再按 `README_USER.md` 运行 dry-run 或真实发送脚本。企业微信 Windows 客户端仍需客户本机提前安装并登录。
 
 ## 群列表 CSV
 

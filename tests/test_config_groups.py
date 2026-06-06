@@ -20,6 +20,7 @@ class ConfigGroupsTest(unittest.TestCase):
         self.assertEqual(cfg.recipient_selection.sentinel.selected_list_region_ratio, [0.670, 0.220, 0.285, 0.760])
         self.assertEqual(cfg.ocr.engine, "paddleocr")
         self.assertEqual(cfg.ocr.fallback, "windows")
+        self.assertEqual(cfg.ocr.model_root, "models/paddleocr")
         self.assertEqual(cfg.source_selection.checkbox_x_ratio, 0.322)
         self.assertEqual(cfg.source_selection.checkbox_y_ratios, [0.547, 0.790])
         self.assertEqual(cfg.source_selection.forward_button_ratio, [0.478, 0.901])

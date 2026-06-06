@@ -4,6 +4,7 @@ import logging
 import json
 import shutil
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime
@@ -94,6 +95,7 @@ class ScreenInspector:
         ocr_engine: str = "paddleocr",
         ocr_lang: str = "ch",
         ocr_fallback: str = "windows",
+        paddle_model_root: str | Path | None = None,
     ):
         self.screenshot_dir = Path(screenshot_dir)
         self.template_dir = Path(template_dir)
@@ -101,6 +103,7 @@ class ScreenInspector:
         self.ocr_engine = ocr_engine
         self.ocr_lang = ocr_lang
         self.ocr_fallback = ocr_fallback
+        self.paddle_model_root = Path(paddle_model_root) if paddle_model_root else None
         (self.screenshot_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
         (self.screenshot_dir / "errors").mkdir(parents=True, exist_ok=True)
 
@@ -254,9 +257,13 @@ class ScreenInspector:
             log.info("PaddleOCR 依赖不可用：%s", exc)
             return []
         try:
-            ocr = PaddleOCR(lang=self.ocr_lang, use_textline_orientation=True)
+            kwargs = self._paddleocr_kwargs()
+            ocr = PaddleOCR(lang=self.ocr_lang, use_textline_orientation=True, **kwargs)
         except TypeError:
-            ocr = PaddleOCR(lang=self.ocr_lang)
+            ocr = PaddleOCR(lang=self.ocr_lang, **kwargs)
+        except Exception as exc:
+            log.warning("PaddleOCR 初始化失败：%s", exc)
+            return []
         try:
             if hasattr(ocr, "predict"):
                 raw = ocr.predict(str(image_path))
@@ -266,6 +273,47 @@ class ScreenInspector:
             log.warning("PaddleOCR 识别失败：%s", exc)
             return []
         return self._parse_paddleocr_result(raw)
+
+    def _paddleocr_kwargs(self) -> dict[str, str]:
+        root = self._resolve_paddle_model_root()
+        if root is None:
+            return {}
+        det_dir = root / "det" / "ch" / "ch_PP-OCRv4_det_infer"
+        rec_dir = root / "rec" / "ch" / "ch_PP-OCRv4_rec_infer"
+        cls_dir = root / "cls" / "ch_ppocr_mobile_v2.0_cls_infer"
+        required = [
+            det_dir / "inference.pdmodel",
+            det_dir / "inference.pdiparams",
+            rec_dir / "inference.pdmodel",
+            rec_dir / "inference.pdiparams",
+            cls_dir / "inference.pdmodel",
+            cls_dir / "inference.pdiparams",
+        ]
+        missing = [path for path in required if not path.exists()]
+        if missing:
+            if self.paddle_model_root is not None:
+                raise FileNotFoundError(f"PaddleOCR 离线模型不完整：{missing}")
+            log.warning("PaddleOCR 离线模型不完整，跳过指定模型目录：%s", missing)
+            return {}
+        return {
+            "det_model_dir": str(det_dir),
+            "rec_model_dir": str(rec_dir),
+            "cls_model_dir": str(cls_dir),
+        }
+
+    def _resolve_paddle_model_root(self) -> Path | None:
+        candidates: list[Path] = []
+        if self.paddle_model_root is not None:
+            return self.paddle_model_root.resolve()
+        candidates.append(Path.cwd() / "models" / "paddleocr")
+        if getattr(sys, "frozen", False):
+            executable_dir = Path(sys.executable).resolve().parent
+            candidates.append(executable_dir / "models" / "paddleocr")
+            candidates.append(Path(getattr(sys, "_MEIPASS", executable_dir)) / "models" / "paddleocr")
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate.resolve()
+        return None
 
     def _parse_paddleocr_result(self, raw: Any) -> list[OcrLine]:
         items: list[Any] = []

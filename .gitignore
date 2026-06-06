@@ -24,4 +24,5 @@ data/*.db
 .ruff_cache/
 dist/
 build/
+*.spec
 *.egg-info/
