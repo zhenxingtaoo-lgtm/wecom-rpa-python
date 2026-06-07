@@ -79,17 +79,18 @@ class ForwardFlow:
         try:
             groups = self._resume_targets(groups)
             rect = self.window.locate()
-            capture_region = Region(rect.left, rect.top, rect.width, rect.height) if rect else None
-            selection_shot = self.screen.save_checkpoint("message_selection_start", region=capture_region)
+            selection_shot = self.screen.save_checkpoint("message_selection_start", region=None)
             if not self.config.dry_run and rect:
                 selected_points = self._source_selected_checkbox_ratios(selection_shot)
+                if len(selected_points) != len(self.source_checkbox_y_ratios):
+                    selected_points = self._source_selected_checkbox_ratios_from_fullscreen(rect, "source_startup_fullscreen_probe")
                 if selected_points:
-                    self._record_exact_source_selection(selection_shot)
+                    self._record_exact_source_selection(selection_shot, rect=rect)
                 elif self.real_send_allowed:
                     log.info("启动时未看到源消息蓝勾，尝试按已记录位置重新进入多选并勾选源消息")
                     self._reselect_source_messages(rect)
                 else:
-                    self._record_exact_source_selection(selection_shot)
+                    self._record_exact_source_selection(selection_shot, rect=rect)
             if self.config.require_confirm_before_start:
                 self._confirm("请确认企业微信已滚动到底部，并且待转发的最后 2-5 条消息可见/已正确选中。")
 
@@ -638,18 +639,27 @@ class ForwardFlow:
             if not self.window.click_screen(click_x, click_y):
                 raise RuntimeError("无法重新勾选待转发消息复选框")
             time.sleep(0.2)
-        image_path = self.screen.save_checkpoint("source_messages_reselected", region=Region(rect.left, rect.top, rect.width, rect.height))
-        if not self._verify_source_messages_selected(image_path):
+        image_path = self.screen.save_checkpoint("source_messages_reselected", region=None)
+        if not self._verify_source_messages_selected(image_path, rect=rect):
             raise RuntimeError("第二轮源消息多选未成功打开或待转发消息未全部勾选")
 
     def _assert_exact_source_selection(self, rect: WindowRect, checkpoint_name: str) -> None:
-        image_path = self.screen.save_checkpoint(checkpoint_name, region=Region(rect.left, rect.top, rect.width, rect.height))
-        if not self._verify_source_messages_selected(image_path):
+        image_path = self.screen.save_checkpoint(checkpoint_name, region=None)
+        if not self._verify_source_messages_selected(image_path, rect=rect):
             raise RuntimeError("源消息勾选数量或位置不符合记录，已停止以避免误发")
 
-    def _record_exact_source_selection(self, image_path) -> None:
+    def _record_exact_source_selection(self, image_path, rect: WindowRect | None = None) -> None:
         selected_points = self._source_selected_checkbox_ratios(image_path)
         expected_count = len(self.source_checkbox_y_ratios)
+        if len(selected_points) != expected_count and rect is not None:
+            fallback_points = self._source_selected_checkbox_ratios_from_fullscreen(rect, "source_fullscreen_probe")
+            if fallback_points:
+                log.info(
+                    "窗口裁剪图源消息蓝勾数量不匹配，已使用全屏截图 fallback：crop=%s fullscreen=%s",
+                    len(selected_points),
+                    len(fallback_points),
+                )
+                selected_points = fallback_points
         if len(selected_points) != expected_count:
             log.warning(
                 "源消息蓝色勾选框数量不等于配置数量：expected=%s actual=%s points=%s",
@@ -669,9 +679,18 @@ class ForwardFlow:
             [round(y, 3) for y in self.source_checkbox_y_ratios],
         )
 
-    def _verify_source_messages_selected(self, image_path) -> bool:
+    def _verify_source_messages_selected(self, image_path, rect: WindowRect | None = None) -> bool:
         points = self._source_selected_checkbox_ratios(image_path)
         expected_count = len(self.source_checkbox_y_ratios)
+        if len(points) != expected_count and rect is not None:
+            fallback_points = self._source_selected_checkbox_ratios_from_fullscreen(rect, "source_verify_fullscreen_probe")
+            if fallback_points:
+                log.info(
+                    "窗口裁剪图源消息复查数量不匹配，已使用全屏截图 fallback：crop=%s fullscreen=%s",
+                    len(points),
+                    len(fallback_points),
+                )
+                points = fallback_points
         if len(points) != expected_count:
             log.warning(
                 "源消息复查失败：蓝色勾选框数量不匹配 expected=%s actual=%s points=%s",
@@ -716,6 +735,28 @@ class ForwardFlow:
             if 0.25 <= x_ratio <= 0.50 and y_ratio >= 0.20
         ]
 
+    def _source_selected_checkbox_ratios_from_fullscreen(self, rect: WindowRect, checkpoint_name: str) -> list[tuple[float, float]]:
+        image_path = self.screen.save_checkpoint(checkpoint_name, region=None)
+        size_getter = getattr(self.screen, "image_size", None)
+        image_size = size_getter(image_path) if callable(size_getter) else None
+        if not image_size:
+            return []
+        image_width, image_height = image_size
+        if image_width <= 0 or image_height <= 0 or rect.width <= 0 or rect.height <= 0:
+            return []
+
+        converted: list[tuple[float, float]] = []
+        for x_ratio, y_ratio in self.screen.find_selected_checkbox_ratios(image_path):
+            abs_x = x_ratio * image_width
+            abs_y = y_ratio * image_height
+            if not (rect.left <= abs_x <= rect.right and rect.top <= abs_y <= rect.bottom):
+                continue
+            local_x = (abs_x - rect.left) / rect.width
+            local_y = (abs_y - rect.top) / rect.height
+            if 0.25 <= local_x <= 0.50 and local_y >= 0.20:
+                converted.append((local_x, local_y))
+        return converted
+
     def _enter_multiselect_from_source(self, rect: WindowRect) -> float:
         for checkbox_y, right_click_x, right_click_y in self._source_context_menu_candidates():
             current_rect = self.window.locate() or rect
@@ -737,7 +778,7 @@ class ForwardFlow:
             time.sleep(0.6)
             opened_shot = self.screen.save_checkpoint(
                 "source_multiselect_opened",
-                region=Region(current_rect.left, current_rect.top, current_rect.width, current_rect.height),
+                region=None,
             )
             opened_points = self._source_selected_checkbox_ratios(opened_shot)
             if not opened_points:

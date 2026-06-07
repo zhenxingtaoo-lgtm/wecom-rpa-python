@@ -4,7 +4,7 @@
 
 1. 使用 Windows 10/11 x64。
 2. 安装并登录企业微信 Windows 客户端。
-3. 解压整个 `WeComRPA` 目录，不要只复制其中的 exe。
+3. 解压整个 `WeComRPA` 目录，不要只复制其中的 exe，也不要在压缩包预览窗口里直接运行 bat。
 4. 确认 `models/paddleocr` 目录存在；包内已包含 PaddleOCR 中文模型，不需要联网下载模型。
 
 ## 首次自检

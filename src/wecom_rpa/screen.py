@@ -129,6 +129,16 @@ class ScreenInspector:
             log.warning("截图不可用，已保存占位文件：%s (%s)", fallback, exc)
             return fallback
 
+    def image_size(self, image_path: str | Path) -> tuple[int, int] | None:
+        try:
+            from PIL import Image  # type: ignore
+
+            with Image.open(image_path) as image:
+                return image.size
+        except Exception as exc:
+            log.debug("读取图片尺寸失败：%s", exc)
+            return None
+
     def find_template(
         self,
         template_name: str,
@@ -523,19 +533,18 @@ $boxes | Sort-Object Y | ConvertTo-Json -Compress
             from PIL import Image  # type: ignore
         except Exception as mss_exc:
             try:
-                # pyautogui 在部分 Windows 环境更容易工作，作为备用。
-                import pyautogui  # type: ignore
-
-                if region is None:
-                    image = pyautogui.screenshot()
-                else:
-                    image = pyautogui.screenshot(region=region.as_tuple())
-                image.save(path)
-                return
+                if self._capture_png_via_pyautogui(path, region):
+                    log.info("截图后端：pyautogui")
+                    return
             except Exception as pyautogui_exc:
                 if self._capture_png_via_powershell(path, region):
+                    log.info("截图后端：powershell")
                     return
                 raise RuntimeError(f"截图依赖不可用：mss={mss_exc}; pyautogui={pyautogui_exc}")
+            if self._capture_png_via_powershell(path, region):
+                log.info("截图后端：powershell")
+                return
+            raise RuntimeError(f"截图依赖不可用：mss={mss_exc}; pyautogui=unknown")
 
         with mss.mss() as sct:
             monitor: dict[str, int]
@@ -545,7 +554,50 @@ $boxes | Sort-Object Y | ConvertTo-Json -Compress
                 monitor = {"left": region.left, "top": region.top, "width": region.width, "height": region.height}
             raw = sct.grab(monitor)
             image = Image.frombytes("RGB", raw.size, raw.rgb)
+            self._save_checked_capture(image, path, region, backend="mss")
+
+    def _save_checked_capture(self, image: Any, path: Path, region: Region | None, *, backend: str) -> None:
+        image.save(path)
+        if not self._is_nearly_black(path):
+            log.info("截图后端：%s", backend)
+            return
+        log.warning("截图后端 %s 生成近似全黑图片，尝试备用截图后端：%s", backend, path)
+        if backend != "pyautogui" and self._capture_png_via_pyautogui(path, region) and not self._is_nearly_black(path):
+            log.info("截图后端：pyautogui")
+            return
+        if self._capture_png_via_powershell(path, region) and not self._is_nearly_black(path):
+            log.info("截图后端：powershell")
+            return
+        log.warning("备用截图后端仍生成近似全黑图片：%s", path)
+
+    def _capture_png_via_pyautogui(self, path: Path, region: Region | None) -> bool:
+        try:
+            import pyautogui  # type: ignore
+
+            if region is None:
+                image = pyautogui.screenshot()
+            else:
+                image = pyautogui.screenshot(region=region.as_tuple())
             image.save(path)
+            return path.exists()
+        except Exception as exc:
+            log.debug("pyautogui 截图失败：%s", exc)
+            return False
+
+    def _is_nearly_black(self, path: Path) -> bool:
+        try:
+            from PIL import Image, ImageStat  # type: ignore
+
+            with Image.open(path) as image:
+                gray = image.convert("L")
+                stat = ImageStat.Stat(gray)
+                mean = float(stat.mean[0])
+                extrema = gray.getextrema()
+                max_value = int(extrema[1]) if extrema else 0
+                return mean <= 3.0 and max_value <= 12
+        except Exception as exc:
+            log.debug("黑屏检测失败：%s", exc)
+            return False
 
     def _capture_png_via_powershell(self, path: Path, region: Region | None) -> bool:
         powershell = _powershell_exe()

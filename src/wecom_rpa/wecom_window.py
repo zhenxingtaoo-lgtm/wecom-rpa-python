@@ -136,7 +136,45 @@ class WeComWindow:
         powershell = _powershell_exe()
         if powershell is None:
             return None
-        script = """
+        script = self._powershell_locator_script()
+        with tempfile.NamedTemporaryFile("w", suffix=".ps1", encoding="utf-8-sig", dir=Path(tempfile.gettempdir()), delete=False) as f:
+            f.write(script)
+            script_path = Path(f.name)
+        try:
+            result = subprocess.run(
+                [str(powershell), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", _windows_path(script_path)],
+                check=False,
+                capture_output=True,
+                timeout=20,
+            )
+            stdout = _decode_process_output(result.stdout)
+            stderr = _decode_process_output(result.stderr)
+            if result.returncode != 0 or not stdout.strip():
+                log.info("PowerShell 未找到企业微信窗口：%s", stderr.strip())
+                return None
+            data = json.loads(stdout.strip().splitlines()[-1])
+            self._last_hwnd = int(data["Hwnd"]) if data.get("Hwnd") is not None else None
+            rect = WindowRect(left=int(data["Left"]), top=int(data["Top"]), width=int(data["Width"]), height=int(data["Height"]))
+            log.info(
+                "PowerShell 找到企业微信窗口：title=%s main_handle=%s rect=%s work_area=%sx%s",
+                data.get("Title"),
+                data.get("IsMainHandle"),
+                rect,
+                data.get("WorkAreaWidth"),
+                data.get("WorkAreaHeight"),
+            )
+            return rect
+        except Exception as exc:
+            log.warning("PowerShell 窗口定位失败：%s", exc)
+            return None
+        finally:
+            try:
+                script_path.unlink()
+            except OSError:
+                pass
+
+    def _powershell_locator_script(self) -> str:
+        return """
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
@@ -155,7 +193,11 @@ public class Win32Rect {
 }
 "@
 [Console]::OutputEncoding=[System.Text.Encoding]::UTF8
-$wxPids = @(Get-Process WXWork -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
+Add-Type -AssemblyName System.Windows.Forms
+$wxProcesses = @(Get-Process WXWork -ErrorAction SilentlyContinue)
+if (-not $wxProcesses) { exit 2 }
+$wxPids = @($wxProcesses | Select-Object -ExpandProperty Id)
+$mainHandles = @($wxProcesses | Where-Object { $_.MainWindowHandle -ne 0 } | ForEach-Object { [long]$_.MainWindowHandle })
 if (-not $wxPids) { exit 2 }
 $candidates = New-Object System.Collections.Generic.List[object]
 $callback = [Win32Rect+EnumWindowsProc]{
@@ -175,15 +217,22 @@ $callback = [Win32Rect+EnumWindowsProc]{
       Top=$rect.Top
       Width=$rect.Right-$rect.Left
       Height=$rect.Bottom-$rect.Top
+      IsMainHandle=($mainHandles -contains $hWnd.ToInt64())
     })
   }
   return $true
 }
 [void][Win32Rect]::EnumWindows($callback, [IntPtr]::Zero)
 $p = $candidates |
+  Where-Object { $_.IsMainHandle -and $_.Width -ge 900 -and $_.Height -ge 600 -and $_.Visible -and $_.Title -like '*企业微信*' -and $_.Title -notlike 'open.work.weixin.qq.com*' } |
+  Sort-Object Width -Descending |
+  Select-Object -First 1
+if (-not $p) {
+  $p = $candidates |
   Where-Object { $_.Width -ge 900 -and $_.Height -ge 600 -and $_.Title -like '*企业微信*' -and $_.Title -notlike 'open.work.weixin.qq.com*' } |
   Sort-Object Width -Descending |
   Select-Object -First 1
+}
 if (-not $p) {
   $p = $candidates |
     Where-Object { $_.Width -ge 900 -and $_.Height -ge 600 -and $_.Visible } |
@@ -192,44 +241,18 @@ if (-not $p) {
 }
 if (-not $p) { exit 2 }
 $h = [IntPtr]$p.Hwnd
-$topMost = [IntPtr](-1)
+$workArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+$targetWidth = [Math]::Min(1600, $workArea.Width)
+$targetHeight = [Math]::Min(900, $workArea.Height)
 [void][Win32Rect]::ShowWindow($h, 9)
-[void][Win32Rect]::SetWindowPos($h, $topMost, 0, 0, 1600, 900, 0x0040)
+[void][Win32Rect]::SetWindowPos($h, [IntPtr]::Zero, $workArea.Left, $workArea.Top, $targetWidth, $targetHeight, 0x0040)
 [void][Win32Rect]::BringWindowToTop($h)
 [void][Win32Rect]::SetForegroundWindow($h)
 Start-Sleep -Milliseconds 300
 $r = New-Object Win32Rect+RECT
 [void][Win32Rect]::GetWindowRect($h, [ref]$r)
-[PSCustomObject]@{ Hwnd=$h.ToInt64(); Left=$r.Left; Top=$r.Top; Width=$r.Right-$r.Left; Height=$r.Bottom-$r.Top; Title=$p.Title } | ConvertTo-Json -Compress
+[PSCustomObject]@{ Hwnd=$h.ToInt64(); Left=$r.Left; Top=$r.Top; Width=$r.Right-$r.Left; Height=$r.Bottom-$r.Top; Title=$p.Title; IsMainHandle=$p.IsMainHandle; WorkAreaWidth=$workArea.Width; WorkAreaHeight=$workArea.Height } | ConvertTo-Json -Compress
 """.strip()
-        with tempfile.NamedTemporaryFile("w", suffix=".ps1", encoding="utf-8-sig", dir=Path(tempfile.gettempdir()), delete=False) as f:
-            f.write(script)
-            script_path = Path(f.name)
-        try:
-            result = subprocess.run(
-                [str(powershell), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", _windows_path(script_path)],
-                check=False,
-                capture_output=True,
-                timeout=20,
-            )
-            stdout = _decode_process_output(result.stdout)
-            stderr = _decode_process_output(result.stderr)
-            if result.returncode != 0 or not stdout.strip():
-                log.info("PowerShell 未找到企业微信窗口：%s", stderr.strip())
-                return None
-            data = json.loads(stdout.strip().splitlines()[-1])
-            self._last_hwnd = int(data["Hwnd"]) if data.get("Hwnd") is not None else None
-            rect = WindowRect(left=int(data["Left"]), top=int(data["Top"]), width=int(data["Width"]), height=int(data["Height"]))
-            log.info("PowerShell 找到企业微信窗口：title=%s rect=%s", data.get("Title"), rect)
-            return rect
-        except Exception as exc:
-            log.warning("PowerShell 窗口定位失败：%s", exc)
-            return None
-        finally:
-            try:
-                script_path.unlink()
-            except OSError:
-                pass
 
     def anchor_point(self, name: str, rect: WindowRect) -> tuple[int, int] | None:
         """把配置中的相对锚点转换为屏幕坐标。

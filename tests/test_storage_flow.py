@@ -815,6 +815,111 @@ class StorageFlowTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "数量不是 2 个"):
                     flow._record_exact_source_selection(root / "source.png")
 
+    def test_source_selection_falls_back_to_fullscreen_when_window_crop_is_clipped(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            cfg = AppConfig(
+                max_total_send=2,
+                batch_size=1,
+                batch_interval_sec=0,
+                dry_run=False,
+                require_confirm_before_start=False,
+                require_confirm_first_batch=False,
+            )
+
+            class FakeScreen:
+                def __init__(self):
+                    self.saved = []
+
+                def save_checkpoint(self, name, region=None):
+                    self.saved.append((name, region))
+                    return root / f"{name}.png"
+
+                def find_selected_checkbox_ratios(self, image_path):
+                    if Path(image_path).name == "source_fullscreen_probe.png":
+                        return [(0.322, 0.500), (0.322, 0.700)]
+                    return []
+
+                def image_size(self, _image_path):
+                    return (1000, 1000)
+
+            with StateStore(root / "state.sqlite3") as store:
+                flow = ForwardFlow(cfg, store, screenshot_dir=str(root / "screenshots"), yes=True, real_send_allowed=True)
+                flow.screen = FakeScreen()
+                flow.source_checkbox_y_ratios = [0.500, 0.700]
+
+                flow._record_exact_source_selection(root / "source_window_crop.png", rect=WindowRect(0, 0, 1000, 1000))
+
+                self.assertEqual(round(flow.source_checkbox_x_ratio, 3), 0.322)
+                self.assertEqual([round(y, 3) for y in flow.source_checkbox_y_ratios], [0.700, 0.500])
+
+    def test_source_message_checkpoints_use_fullscreen_screenshots(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            cfg = AppConfig(
+                max_total_send=2,
+                batch_size=1,
+                batch_interval_sec=0,
+                dry_run=False,
+                require_confirm_before_start=False,
+                require_confirm_first_batch=False,
+            )
+
+            class FakeWindow:
+                def __init__(self):
+                    self.rect = WindowRect(0, 0, 1440, 852)
+
+                def locate(self):
+                    return self.rect
+
+                def right_click_relative(self, *_args):
+                    return True
+
+                def click_screen(self, *_args):
+                    return True
+
+            class FakeScreen:
+                def __init__(self):
+                    self.saved = []
+
+                def save_checkpoint(self, name, region=None):
+                    self.saved.append((name, region))
+                    return root / f"{name}.png"
+
+                def find_selected_checkbox_ratios(self, image_path):
+                    name = Path(image_path).stem
+                    if name in {"message_selection_start", "batch_1_source_before_forward", "source_multiselect_opened", "source_messages_reselected"}:
+                        return [(0.322, 0.700), (0.322, 0.500)]
+                    return []
+
+                def ocr_lines(self, *_args, **_kwargs):
+                    return [OcrLine("多选", 100, 200, 60, 20)]
+
+            with StateStore(root / "state.sqlite3") as store:
+                flow = ForwardFlow(cfg, store, screenshot_dir=str(root / "screenshots"), yes=True, real_send_allowed=True)
+                flow.window = FakeWindow()
+                flow.screen = FakeScreen()
+                flow.source_checkbox_y_ratios = [0.700, 0.500]
+
+                flow.run([])
+                flow._assert_exact_source_selection(WindowRect(0, 0, 1440, 852), "batch_1_source_before_forward")
+                flow._enter_multiselect_from_source(WindowRect(0, 0, 1440, 852))
+                flow._reselect_source_messages(WindowRect(0, 0, 1440, 852))
+
+                source_checkpoint_names = {
+                    "message_selection_start",
+                    "batch_1_source_before_forward",
+                    "source_multiselect_opened",
+                    "source_messages_reselected",
+                }
+                source_regions = {
+                    name: region
+                    for name, region in flow.screen.saved
+                    if name in source_checkpoint_names
+                }
+                self.assertEqual(set(source_regions), source_checkpoint_names)
+                self.assertTrue(all(region is None for region in source_regions.values()))
+
     def test_real_send_marks_uncertain_when_post_send_evidence_missing(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)

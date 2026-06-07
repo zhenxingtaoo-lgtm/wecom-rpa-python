@@ -1,6 +1,7 @@
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from wecom_rpa.safety import StopController, assert_batch_selection_count, assert_send_limit
 from wecom_rpa.screen import OcrLine, ScreenInspector
@@ -33,6 +34,21 @@ class SafetyWindowScreenTest(unittest.TestCase):
         self.assertEqual(window.anchor_point("search_box", rect), (500, 320))
         self.assertIsNone(window.anchor_point("missing", rect))
 
+    def test_powershell_locator_prefers_main_window_without_topmost(self):
+        script = WeComWindow("企业微信")._powershell_locator_script()
+
+        self.assertIn("MainWindowHandle", script)
+        self.assertIn("IsMainHandle", script)
+        self.assertNotIn("[IntPtr](-1)", script)
+
+    def test_powershell_locator_clamps_window_to_working_area(self):
+        script = WeComWindow("企业微信")._powershell_locator_script()
+
+        self.assertIn("WorkingArea", script)
+        self.assertIn("[Math]::Min(1600", script)
+        self.assertIn("[Math]::Min(900", script)
+        self.assertNotIn("0, 0, 1600, 900", script)
+
     def test_scroll_chat_to_bottom_validates_repeats(self):
         window = WeComWindow("企业微信")
         with self.assertRaisesRegex(ValueError, "repeats"):
@@ -44,6 +60,24 @@ class SafetyWindowScreenTest(unittest.TestCase):
             path = inspector.save_checkpoint("hello/world")
             self.assertTrue(path.exists())
             self.assertTrue(path.suffix in {".png", ".txt"})
+
+    def test_mss_black_capture_falls_back_to_powershell(self):
+        with tempfile.TemporaryDirectory() as d:
+            inspector = ScreenInspector(Path(d) / "screenshots")
+            fallback = Path(d) / "fallback.png"
+            path = Path(d) / "capture.png"
+
+            from PIL import Image
+
+            Image.new("RGB", (8, 8), (12, 34, 56)).save(fallback)
+
+            with mock.patch.object(inspector, "_capture_png_via_pyautogui", return_value=False), mock.patch.object(
+                inspector, "_capture_png_via_powershell", side_effect=lambda target, _region: fallback.replace(target) or True
+            ):
+                inspector._save_checked_capture(Image.new("RGB", (8, 8), (0, 0, 0)), path, None, backend="mss")
+
+            self.assertTrue(path.exists())
+            self.assertFalse(inspector._is_nearly_black(path))
 
     def test_find_template_missing_returns_none(self):
         with tempfile.TemporaryDirectory() as d:
