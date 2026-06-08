@@ -1,6 +1,6 @@
 # 企业微信 RPA
 
-安全优先的企业微信 Windows 桌面端批量转发 RPA。默认 dry-run；真实发送必须显式关闭 dry-run，并同时提供两级真实发送授权参数。
+安全优先的企业微信 Windows 桌面端批量转发 RPA。默认 dry-run；真实发送必须显式关闭 dry-run，并同时提供两级真实发送授权参数。项目同时提供 CLI 和 Tkinter GUI 两种入口。
 
 ## 已实现
 
@@ -13,15 +13,17 @@
 - dry-run 状态机：`pending -> selected -> skipped`
 - 收件人选择策略已改为 `bottom_of_picker`：在“选择聊天/发送给”弹窗内滚到底部，连续选择底部最多 9 个会话；不按群名搜索，也不区分客户群/员工/机器人
 - 可选哨兵边界：识别左侧已勾选候选列表，遇到配置的员工私聊哨兵时，只发送哨兵下面的会话
+- 真实发送路径：在人工确认和双重授权后，通过 PowerShell/Win32 坐标操作打开转发弹窗、滚动到底部、勾选收件人、点击发送并截图复查
+- 后续批次源消息重选：通过右键菜单重新进入多选，并用蓝色复选框检测校验源消息选中状态
 - 日志输出到控制台和 `logs/wecom_rpa.log`
-- 急停接口：支持 `keyboard` 可用时注册全局热键，缺依赖时安全降级
+- 急停接口：CLI 支持 `keyboard` 可用时注册全局热键；GUI 运行时使用界面上的“立即停止”按钮
 - 截图保存：支持 `mss/Pillow` 或 `pyautogui`，无 GUI 时写占位文件
 - OpenCV 模板匹配框架：模板缺失或依赖缺失时返回未匹配，不执行危险动作
-- 企业微信窗口定位：支持 `pygetwindow` 枚举窗口，非 Windows/无 GUI 时安全返回 `None`
-- 选择最后消息前会先尝试把当前会话滚动到底部，避免停在历史位置误选
-- OCR 接口占位：预留搜索结果校验入口
-- OCR 后端可配置，默认优先 PaddleOCR，失败时回退 Windows OCR
-- CLI 入口和基础测试
+- 企业微信窗口定位：优先通过 PowerShell 枚举/激活/调整 Windows 企业微信主窗口，必要时回退 `pygetwindow`
+- OCR 后端可配置：支持 PaddleOCR、Windows OCR、Tesseract；默认优先 PaddleOCR，失败时回退 Windows OCR
+- 蓝色复选框检测：通过 PowerShell `System.Drawing` 扫描截图中的蓝色勾选框，用于源消息和收件人复查
+- Tkinter GUI：提供参数选择、环境检查、运行摘要、日志面板、真实发送确认和急停按钮
+- CLI 入口、GUI 入口、校准入口和基础测试
 
 ## 安装/运行
 
@@ -45,6 +47,14 @@ $env:UV_HTTP_TIMEOUT='120'
 
 WSL 中的 PaddlePaddle 预编译包可能因为 CPU 指令集触发 `Illegal instruction`。真实 GUI 调试建议使用上面的 Windows 原生环境运行。
 
+GUI 启动：
+
+```powershell
+.\.venv-paddle-win\Scripts\python.exe -m wecom_rpa.gui
+```
+
+打包版客户电脑可双击 `run-gui.bat`。GUI 默认进入 `Dry-run 自检` 模式；切换到 `真实发送` 后必须勾选两个确认项，并在启动弹窗中输入 `SEND`。
+
 校准截图自检（只截图/裁剪，不点击）：
 
 ```bash
@@ -64,7 +74,7 @@ python -m wecom_rpa.main \
 
 `--yes` 仅跳过人工确认，适合测试/cron；不会关闭 dry-run。
 
-真实发送必须同时提供以下参数：
+CLI 真实发送必须同时提供以下参数：
 
 ```powershell
 $env:PYTHONPATH='src'
@@ -91,7 +101,7 @@ python -m wecom_rpa.main \
   --dry-run
 ```
 
-真实发送前请确认企业微信窗口可见、待转发源消息已正确选中，并确保 `config/config.example.yaml` 中的源消息坐标和转发按钮坐标与当前窗口布局一致。
+真实发送前请确认企业微信窗口可见、待转发源消息已正确选中，并确保配置文件中的源消息坐标、转发按钮坐标、哨兵名称和 OCR 模型目录与当前窗口布局一致。实机推荐使用 `config/real_send_until_daxiaochen.yaml` 或按校准结果维护自己的真实发送配置。
 
 ## 配置
 
@@ -100,7 +110,7 @@ python -m wecom_rpa.main \
 - `max_total_send` 必须大于 0
 - `batch_size` 必须在 `1..9` 之间
 - `dry_run: false` 或 `--no-dry-run` 只有在同时传入 `--real-send` 和 `--i-understand-this-will-send-messages` 时才允许
-- 默认 `recipient_selection.mode: bottom_of_picker`，代表后续真实实现走“弹窗底部连续勾选”路线；`groups.csv` 在这个模式下主要作为发送数量/批次数占位记录，不用于搜索群名。
+- 默认 `recipient_selection.mode: bottom_of_picker`，真实发送会走“弹窗底部连续勾选”路线；`groups.csv` 在这个模式下主要作为发送数量/批次数占位记录，不用于搜索群名。
 
 OCR 默认配置：
 
@@ -129,6 +139,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\check_release.ps1
 - `build\WeComRPA.zip`：发给客户测试的压缩包。
 
 客户电脑只需要解压整个目录，先运行 `check-ocr-models.bat` 验证离线 OCR 模型，再按 `README_USER.md` 运行 dry-run 或真实发送脚本。企业微信 Windows 客户端仍需客户本机提前安装并登录。
+打包目录会同时包含 CLI 可执行文件和 GUI 可执行文件，推荐普通用户优先使用 `run-gui.bat`。
 
 ## 群列表 CSV
 
@@ -220,10 +231,10 @@ recipient_selection:
    - `error_dialog.png`
 5. 校准 `config/config.example.yaml` 的 `window.anchors` 相对锚点。
 
-## 后续待做
+## 当前限制与后续待做
 
-1. 采集企业微信按钮模板，并在 Windows 实机验证匹配阈值。
-2. 接入 OCR 搜索结果校验。
-3. 在 dry-run 中实现“搜索目标群并校验选择”的实机模拟路径。
-4. 固化最后 N 条消息的多屏滚动采集、复选框识别和选中数量校验。
-5. 在人工确认和多重保护下实现真实选择/发送动作。
+1. 继续在更多 Windows 分辨率、DPI、企业微信版本上验证并微调相对坐标、OCR 区域和蓝色复选框阈值。
+2. 若重新启用 `search_by_name` 策略，需要补齐按群名搜索、OCR 校验搜索结果和 dry-run 模拟路径；当前主路径是 `bottom_of_picker`。
+3. 当前仍要求用户人工预选源消息；后续可评估自动定位最后 N 条消息，但必须保留人工确认和截图复查。
+4. 模板匹配框架已接入，但主流程主要依赖相对坐标、OCR 和蓝色复选框检测；如要改成模板优先，需要采集企业微信按钮模板并实机验证阈值。
+5. GUI 已提供启动和急停控制，后续可增加配置编辑器、状态库人工复查/修复界面和最近截图预览。
