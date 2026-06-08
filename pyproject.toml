@@ -27,6 +27,7 @@ windows = [
 [project.scripts]
 wecom-rpa = "wecom_rpa.main:main"
 wecom-rpa-calibrate = "wecom_rpa.calibration:main"
+wecom-rpa-gui = "wecom_rpa.gui:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

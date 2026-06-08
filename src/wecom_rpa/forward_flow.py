@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
+from typing import Any, Callable
 
 from .config import AppConfig
 from .groups import split_batches
@@ -44,12 +45,19 @@ class ForwardFlow:
         screenshot_dir: str = "screenshots",
         yes: bool = False,
         real_send_allowed: bool = False,
+        stop_controller: StopController | None = None,
+        install_stop_hotkey: bool = True,
+        confirm_callback: Callable[[str], bool] | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ):
         self.config = config
         self.store = store
         self.yes = yes
         self.real_send_allowed = real_send_allowed
-        self.stop = StopController(config.stop_hotkey)
+        self.stop = stop_controller or StopController(config.stop_hotkey)
+        self.install_stop_hotkey = install_stop_hotkey
+        self.confirm_callback = confirm_callback
+        self.progress_callback = progress_callback
         self.screen = ScreenInspector(
             screenshot_dir,
             template_threshold=config.vision.template_threshold,
@@ -63,9 +71,28 @@ class ForwardFlow:
         self.source_checkbox_y_ratios = list(config.source_selection.checkbox_y_ratios)
         self.boundary_reached = False
 
+    def _emit_progress(self, event: str, **payload: Any) -> None:
+        if self.progress_callback is None:
+            return
+        try:
+            self.progress_callback({"event": event, **payload})
+        except Exception as exc:
+            log.debug("进度回调失败：event=%s reason=%s", event, exc)
+
+    def _sleep(self, seconds: float) -> None:
+        deadline = time.monotonic() + max(0.0, seconds)
+        while time.monotonic() < deadline:
+            if self.stop.should_stop():
+                return
+            time.sleep(min(0.1, deadline - time.monotonic()))
+
     def _confirm(self, prompt: str) -> None:
         if self.yes:
             log.info("跳过人工确认：%s", prompt)
+            return
+        if self.confirm_callback is not None:
+            if not self.confirm_callback(prompt):
+                raise RuntimeError("用户未确认，流程停止")
             return
         answer = input(f"{prompt} 输入 YES 继续：").strip()
         if answer != "YES":
@@ -74,9 +101,11 @@ class ForwardFlow:
     def run(self, groups: list[TargetGroup]) -> FlowResult:
         self.store.upsert_targets(groups)
         run_id = self.store.start_run(self.config)
-        self.stop.install()
+        if self.install_stop_hotkey:
+            self.stop.install()
         status = "completed"
         try:
+            self._emit_progress("run_started", total_targets=len(groups), dry_run=self.config.dry_run)
             groups = self._resume_targets(groups)
             rect = self.window.locate()
             selection_shot = self.screen.save_checkpoint("message_selection_start", region=None)
@@ -116,7 +145,7 @@ class ForwardFlow:
                 if batch.batch_no == 1 and self.config.require_confirm_first_batch:
                     self._confirm("第一批开始前确认。dry-run 不会真实发送。")
                 log.info("开始处理批次 %s，目标数=%s", batch.batch_no, len(batch.targets))
-                self._run_batch(batch.batch_no, batch.targets)
+                self._run_batch(batch.batch_no, batch.targets, total_batches=len(batches))
                 if self.boundary_reached:
                     for remaining_batch in batches[batch_index + 1 :]:
                         for target in remaining_batch.targets:
@@ -124,16 +153,19 @@ class ForwardFlow:
                     log.info("检测到哨兵边界，尾批处理完成后结束任务")
                     break
                 if batch.batch_no < len(batches) and self.config.batch_interval_sec > 0:
-                    time.sleep(self.config.batch_interval_sec)
+                    self._sleep(self.config.batch_interval_sec)
         except Exception as exc:
             status = "failed"
             log.exception("流程失败：%s", exc)
             self.screen.save_error("flow_failed", str(exc))
             raise
         finally:
-            self.stop.uninstall()
+            if self.install_stop_hotkey:
+                self.stop.uninstall()
             self.store.finish_run(run_id, status)
-        return FlowResult(run_id=run_id, status=status, summary=self.store.summary())
+        result = FlowResult(run_id=run_id, status=status, summary=self.store.summary())
+        self._emit_progress("run_finished", run_id=run_id, status=status, summary=result.summary)
+        return result
 
     def _resume_targets(self, groups: list[TargetGroup]) -> list[TargetGroup]:
         statuses = self.store.get_statuses([group.group_name for group in groups])
@@ -147,7 +179,14 @@ class ForwardFlow:
             log.info("断点续跑：跳过已完成目标 %s 个，继续处理 %s 个", skipped, len(runnable))
         return runnable
 
-    def _run_batch(self, batch_no: int, targets: list[TargetGroup]) -> None:
+    def _run_batch(self, batch_no: int, targets: list[TargetGroup], *, total_batches: int | None = None) -> None:
+        self._emit_progress(
+            "batch_started",
+            batch_no=batch_no,
+            total_batches=total_batches,
+            target_count=len(targets),
+            summary=self.store.summary(),
+        )
         self.screen.save_checkpoint(f"batch_{batch_no}_before")
         if self.config.recipient_selection.mode == "bottom_of_picker":
             if self.config.dry_run:
@@ -157,6 +196,12 @@ class ForwardFlow:
         else:
             self._run_search_by_name_batch(batch_no, targets)
         self.screen.save_checkpoint(f"batch_{batch_no}_after")
+        self._emit_progress(
+            "batch_finished",
+            batch_no=batch_no,
+            total_batches=total_batches,
+            summary=self.store.summary(),
+        )
 
     def _run_bottom_picker_batch(self, batch_no: int, targets: list[TargetGroup]) -> None:
         """新方案 dry-run：不搜索群名，模拟在选择聊天弹窗底部连续勾选。
@@ -228,7 +273,7 @@ class ForwardFlow:
             # 接收方选择弹窗左侧列表滚到底部。
             for _ in range(self.config.recipient_selection.scroll_to_bottom_repeats):
                 self.window.mouse_wheel_relative(rect, 0.493, 0.646, -1200)
-                time.sleep(0.15)
+                self._sleep(0.15)
 
             target_checkbox_x = self._recipient_checkbox_x_ratio(rect)
             target_checkbox_y = self._recipient_checkbox_rows_bottom_to_top(selected_count, rect)
@@ -283,7 +328,7 @@ class ForwardFlow:
             # 弹窗右下角发送按钮。
             if not self._click_final_send_button(rect):
                 raise RuntimeError("无法点击发送按钮")
-            time.sleep(2.0)
+            self._sleep(2.0)
             evidence = self.screen.save_checkpoint(f"batch_{batch_no}_post_send", region=Region(rect.left, rect.top, rect.width, rect.height))
             if evidence.suffix.lower() != ".png":
                 self._mark_targets_uncertain(effective_targets, batch_no, "发送后截图证据不可用")
@@ -309,10 +354,10 @@ class ForwardFlow:
         forward_x, forward_y = self.config.source_selection.forward_button_ratio
         if not self.window.click_relative(rect, forward_x, forward_y):
             raise RuntimeError("无法点击转发按钮")
-        time.sleep(0.4)
+        self._sleep(0.4)
         # 下拉菜单中"逐条转发"通常是第一项，按 Enter 即可选中。
         self.window.send_keys("{ENTER}")
-        time.sleep(1.0)
+        self._sleep(1.0)
         picker_shot = self.screen.save_checkpoint(f"batch_{batch_no}_recipient_picker_opened", region=Region(rect.left, rect.top, rect.width, rect.height))
         if not self._has_ocr_text(picker_shot, ("发送给", "分别发送给")):
             raise RuntimeError("点击逐条转发后未识别到发送给弹窗，已停止以避免误点会话列表")
@@ -505,7 +550,7 @@ class ForwardFlow:
         for attempt_x, attempt_y in attempts:
             if not self._click_recipient_checkbox(rect, attempt_x, attempt_y):
                 continue
-            time.sleep(0.25)
+            self._sleep(0.25)
             if self._is_left_row_selected(rect, y_ratio, checkpoint_name=f"recipient_row_{index}_after"):
                 return
         raise RuntimeError(f"无法确认第 {index} 个接收会话已勾选：y_ratio={y_ratio:.3f}")
@@ -525,7 +570,7 @@ class ForwardFlow:
         for attempt_x, attempt_y in attempts:
             if not self._click_recipient_checkbox(rect, attempt_x, attempt_y):
                 continue
-            time.sleep(0.25)
+            self._sleep(0.25)
             if not self._is_left_row_selected(rect, y_ratio, checkpoint_name=f"recipient_uncheck_{name}_after"):
                 return
         raise RuntimeError(f"无法确认左侧已勾选项已取消：{name}")
@@ -609,7 +654,7 @@ class ForwardFlow:
                 raise RuntimeError(f"无法删除已选项：缺少 y 坐标 name={recipient.name}")
             if not self.window.click_relative(rect, remove_x, recipient.y_ratio):
                 raise RuntimeError(f"无法删除已选项：{recipient.name}")
-            time.sleep(0.15)
+            self._sleep(0.15)
 
     def _uncheck_left_recipients(self, rect: WindowRect, recipients: list[SelectedRecipient]) -> None:
         checkbox_x = self._recipient_checkbox_x_ratio(rect)
@@ -627,7 +672,7 @@ class ForwardFlow:
             send_keys = getattr(self.window, "send_keys", None)
             if not callable(send_keys) or not send_keys("{ESC}"):
                 self.window.click_screen(rect.left + int(rect.width * 0.863), rect.top + int(rect.height * 0.253))
-        time.sleep(0.5)
+        self._sleep(0.5)
 
     def _reselect_source_messages(self, rect: WindowRect) -> None:
         """后续批次只通过复选框列重选源消息，避免误触消息正文里的链接。"""
@@ -638,7 +683,7 @@ class ForwardFlow:
             click_x, click_y = rect.relative_point(self.source_checkbox_x_ratio, y_ratio)
             if not self.window.click_screen(click_x, click_y):
                 raise RuntimeError("无法重新勾选待转发消息复选框")
-            time.sleep(0.2)
+            self._sleep(0.2)
         image_path = self.screen.save_checkpoint("source_messages_reselected", region=None)
         if not self._verify_source_messages_selected(image_path, rect=rect):
             raise RuntimeError("第二轮源消息多选未成功打开或待转发消息未全部勾选")
@@ -762,7 +807,7 @@ class ForwardFlow:
             current_rect = self.window.locate() or rect
             if not self.window.right_click_relative(current_rect, right_click_x, right_click_y):
                 continue
-            time.sleep(0.45)
+            self._sleep(0.45)
             menu_shot = self.screen.save_checkpoint(
                 f"source_context_menu_{right_click_x:.3f}_{right_click_y:.3f}",
                 region=Region(current_rect.left, current_rect.top, current_rect.width, current_rect.height),
@@ -775,7 +820,7 @@ class ForwardFlow:
             click_y = current_rect.top + menu_line.center_y
             if not self.window.click_screen(click_x, click_y):
                 raise RuntimeError("无法点击右键菜单中的多选")
-            time.sleep(0.6)
+            self._sleep(0.6)
             opened_shot = self.screen.save_checkpoint(
                 "source_multiselect_opened",
                 region=None,

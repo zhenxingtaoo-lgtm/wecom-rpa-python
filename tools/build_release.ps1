@@ -23,7 +23,7 @@ Push-Location $Root
 try {
   & $Python -m PyInstaller --version | Out-Null
 
-  Remove-Item -Recurse -Force $ReleaseRoot, $ZipPath, (Join-Path $DistRoot "wecom-rpa") -ErrorAction SilentlyContinue
+  Remove-Item -Recurse -Force $ReleaseRoot, $ZipPath, (Join-Path $DistRoot "wecom-rpa"), (Join-Path $DistRoot "wecom-rpa-gui") -ErrorAction SilentlyContinue
 
   & $Python -m PyInstaller `
     --noconfirm `
@@ -49,8 +49,34 @@ try {
     --hidden-import pytesseract `
     tools\pyinstaller_entry.py
 
+  & $Python -m PyInstaller `
+    --noconfirm `
+    --clean `
+    --onedir `
+    --windowed `
+    --name wecom-rpa-gui `
+    --paths src `
+    --collect-all paddle `
+    --collect-all paddleocr `
+    --collect-all Cython `
+    --collect-all cv2 `
+    --collect-all skimage `
+    --collect-all imgaug `
+    --copy-metadata imageio `
+    --copy-metadata imgaug `
+    --hidden-import imghdr `
+    --hidden-import pyclipper `
+    --hidden-import lmdb `
+    --hidden-import rapidfuzz `
+    --hidden-import pyautogui `
+    --hidden-import mss `
+    --hidden-import pygetwindow `
+    --hidden-import pytesseract `
+    tools\pyinstaller_gui_entry.py
+
   New-Item -ItemType Directory -Force $ReleaseRoot | Out-Null
   Copy-Item -Recurse -Force (Join-Path $DistRoot "wecom-rpa") $AppRoot
+  Copy-Item -Recurse -Force (Join-Path $DistRoot "wecom-rpa-gui\*") $AppRoot
   Copy-Item -Recurse -Force config (Join-Path $ReleaseRoot "config")
   Copy-Item -Recurse -Force templates (Join-Path $ReleaseRoot "templates")
   New-Item -ItemType Directory -Force (Join-Path $ReleaseRoot "data") | Out-Null
