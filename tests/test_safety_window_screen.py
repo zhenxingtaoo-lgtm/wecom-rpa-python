@@ -85,6 +85,24 @@ class SafetyWindowScreenTest(unittest.TestCase):
             inspector = ScreenInspector(Path(d) / "screenshots", template_dir=Path(d) / "templates")
             self.assertIsNone(inspector.find_template("missing.png"))
 
+    def test_selected_checkbox_detection_handles_high_dpi_screenshot(self):
+        with tempfile.TemporaryDirectory() as d:
+            from PIL import Image, ImageDraw
+
+            image_path = Path(d) / "high_dpi.png"
+            image = Image.new("RGB", (2880, 1800), (245, 247, 250))
+            draw = ImageDraw.Draw(image)
+            draw.rectangle((900, 1160, 935, 1195), fill=(0, 120, 230))
+            draw.rectangle((900, 1510, 935, 1545), fill=(0, 120, 230))
+            image.save(image_path)
+
+            points = ScreenInspector(Path(d) / "screenshots").find_selected_checkbox_ratios(image_path)
+
+            self.assertEqual(len(points), 2)
+            self.assertAlmostEqual(points[0][0], 917.5 / 2880, places=3)
+            self.assertAlmostEqual(points[0][1], 1177.5 / 1800, places=3)
+            self.assertAlmostEqual(points[1][1], 1527.5 / 1800, places=3)
+
     def test_windows_ocr_json_maps_to_lines(self):
         with tempfile.TemporaryDirectory() as d:
             inspector = ScreenInspector(Path(d) / "screenshots")

@@ -704,7 +704,7 @@ class ForwardFlow:
             raise RuntimeError("源消息勾选数量或位置不符合记录，已停止以避免误发")
 
     def _record_exact_source_selection(self, image_path, rect: WindowRect | None = None) -> None:
-        selected_points = self._source_selected_checkbox_ratios(image_path)
+        selected_points = self._source_selected_checkbox_ratios_in_window(image_path, rect) if rect is not None else self._source_selected_checkbox_ratios(image_path)
         expected_count = len(self.source_checkbox_y_ratios)
         if len(selected_points) != expected_count and rect is not None:
             fallback_points = self._source_selected_checkbox_ratios_from_fullscreen(rect, "source_fullscreen_probe")
@@ -735,7 +735,7 @@ class ForwardFlow:
         )
 
     def _verify_source_messages_selected(self, image_path, rect: WindowRect | None = None) -> bool:
-        points = self._source_selected_checkbox_ratios(image_path)
+        points = self._source_selected_checkbox_ratios_in_window(image_path, rect) if rect is not None else self._source_selected_checkbox_ratios(image_path)
         expected_count = len(self.source_checkbox_y_ratios)
         if len(points) != expected_count and rect is not None:
             fallback_points = self._source_selected_checkbox_ratios_from_fullscreen(rect, "source_verify_fullscreen_probe")
@@ -790,24 +790,48 @@ class ForwardFlow:
             if 0.25 <= x_ratio <= 0.50 and y_ratio >= 0.20
         ]
 
+    def _source_selected_checkbox_ratios_in_window(self, image_path, rect: WindowRect | None) -> list[tuple[float, float]]:
+        if rect is None:
+            return self._source_selected_checkbox_ratios(image_path)
+        size_getter = getattr(self.screen, "image_size", None)
+        image_size = size_getter(image_path) if callable(size_getter) else None
+        if not image_size:
+            return self._source_selected_checkbox_ratios(image_path)
+        return self._convert_fullscreen_checkbox_ratios_to_window(image_path, rect, image_size)
+
     def _source_selected_checkbox_ratios_from_fullscreen(self, rect: WindowRect, checkpoint_name: str) -> list[tuple[float, float]]:
         image_path = self.screen.save_checkpoint(checkpoint_name, region=None)
         size_getter = getattr(self.screen, "image_size", None)
         image_size = size_getter(image_path) if callable(size_getter) else None
         if not image_size:
             return []
+        return self._convert_fullscreen_checkbox_ratios_to_window(image_path, rect, image_size)
+
+    def _convert_fullscreen_checkbox_ratios_to_window(
+        self,
+        image_path,
+        rect: WindowRect,
+        image_size: tuple[int, int],
+    ) -> list[tuple[float, float]]:
         image_width, image_height = image_size
         if image_width <= 0 or image_height <= 0 or rect.width <= 0 or rect.height <= 0:
             return []
+        scale = 1.0
+        if image_width > rect.width * 1.25:
+            scale = image_width / rect.width
 
         converted: list[tuple[float, float]] = []
         for x_ratio, y_ratio in self.screen.find_selected_checkbox_ratios(image_path):
             abs_x = x_ratio * image_width
             abs_y = y_ratio * image_height
-            if not (rect.left <= abs_x <= rect.right and rect.top <= abs_y <= rect.bottom):
+            scaled_left = rect.left * scale
+            scaled_top = rect.top * scale
+            scaled_width = rect.width * scale
+            scaled_height = rect.height * scale
+            if not (scaled_left <= abs_x <= scaled_left + scaled_width and scaled_top <= abs_y <= scaled_top + scaled_height):
                 continue
-            local_x = (abs_x - rect.left) / rect.width
-            local_y = (abs_y - rect.top) / rect.height
+            local_x = (abs_x - scaled_left) / scaled_width
+            local_y = (abs_y - scaled_top) / scaled_height
             if 0.25 <= local_x <= 0.50 and local_y >= 0.20:
                 converted.append((local_x, local_y))
         return converted

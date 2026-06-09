@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import json
 import sys
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -408,11 +409,92 @@ $items | ConvertTo-Json -Compress
     def find_selected_checkbox_ratios(self, image_path: str | Path) -> list[tuple[float, float]]:
         """识别当前窗口截图里已选源消息的蓝色复选框中心点比例。
 
-        不依赖 Python 图像库；Windows 实机上通过 System.Drawing 扫描蓝色小方块。
+        优先用 Pillow 在当前进程内扫描，避免高 DPI 截图下反复启动 PowerShell。
+        Pillow 不可用时再通过 Windows System.Drawing fallback。
         """
         image = Path(image_path)
         if not image.exists() or image.suffix.lower() != ".png":
             return []
+        points = self._find_selected_checkbox_ratios_via_pillow(image)
+        if points:
+            return points
+        return self._find_selected_checkbox_ratios_via_powershell(image)
+
+    def _checkbox_size_limits(self, width: int, height: int) -> tuple[int, int, int]:
+        scale = max(width / 1440.0, height / 900.0, 1.0)
+        min_size = max(8, int(7 * scale))
+        max_size = max(28, int(24 * scale))
+        max_delta = max(8, int(6 * scale))
+        return min_size, max_size, max_delta
+
+    def _is_selected_checkbox_blue(self, r: int, g: int, b: int) -> bool:
+        return b > 170 and 90 < g < 190 and r < 100
+
+    def _find_selected_checkbox_ratios_via_pillow(self, image_path: Path) -> list[tuple[float, float]]:
+        try:
+            from PIL import Image  # type: ignore
+        except Exception as exc:
+            log.debug("Pillow 不可用，跳过 Python 蓝勾扫描：%s", exc)
+            return []
+        try:
+            with Image.open(image_path) as raw:
+                image = raw.convert("RGB")
+                width, height = image.size
+                pixels = image.load()
+                visited: set[tuple[int, int]] = set()
+                min_size, max_size, max_delta = self._checkbox_size_limits(width, height)
+                points: list[tuple[float, float]] = []
+                start_y = int(height * 0.05)
+                start_x = int(width * 0.12)
+                end_x = int(width * 0.95)
+                for y in range(start_y, height):
+                    for x in range(start_x, end_x):
+                        if (x, y) in visited:
+                            continue
+                        r, g, b = pixels[x, y]
+                        if not self._is_selected_checkbox_blue(r, g, b):
+                            visited.add((x, y))
+                            continue
+                        queue: deque[tuple[int, int]] = deque([(x, y)])
+                        visited.add((x, y))
+                        min_x = max_x = x
+                        min_y = max_y = y
+                        count = 0
+                        while queue:
+                            px, py = queue.popleft()
+                            count += 1
+                            min_x = min(min_x, px)
+                            max_x = max(max_x, px)
+                            min_y = min(min_y, py)
+                            max_y = max(max_y, py)
+                            for nx, ny in ((px + 1, py), (px - 1, py), (px, py + 1), (px, py - 1)):
+                                if nx < 0 or ny < 0 or nx >= width or ny >= height or (nx, ny) in visited:
+                                    continue
+                                nr, ng, nb = pixels[nx, ny]
+                                visited.add((nx, ny))
+                                if self._is_selected_checkbox_blue(nr, ng, nb):
+                                    queue.append((nx, ny))
+                        box_width = max_x - min_x + 1
+                        box_height = max_y - min_y + 1
+                        if (
+                            count >= 40
+                            and min_size <= box_width <= max_size
+                            and min_size <= box_height <= max_size
+                            and abs(box_width - box_height) <= max_delta
+                        ):
+                            points.append((((min_x + max_x) / 2.0) / width, ((min_y + max_y) / 2.0) / height))
+                log.info(
+                    "蓝色复选框扫描：backend=pillow image=%sx%s points=%s",
+                    width,
+                    height,
+                    [(round(x, 3), round(y, 3)) for x, y in points],
+                )
+                return sorted(points, key=lambda point: point[1])
+        except Exception as exc:
+            log.debug("Pillow 蓝勾扫描失败：%s", exc)
+            return []
+
+    def _find_selected_checkbox_ratios_via_powershell(self, image: Path) -> list[tuple[float, float]]:
         powershell = powershell_exe()
         if powershell is None:
             return []
@@ -423,6 +505,10 @@ Add-Type -AssemblyName System.Drawing
 $img = [System.Drawing.Bitmap]::FromFile($ImagePath)
 $w = $img.Width
 $h = $img.Height
+$scale = [Math]::Max([Math]::Max($w / 1440.0, $h / 900.0), 1.0)
+$minSize = [Math]::Max(8, [int](7 * $scale))
+$maxSize = [Math]::Max(28, [int](24 * $scale))
+$maxDelta = [Math]::Max(8, [int](6 * $scale))
 $visited = New-Object 'bool[,]' $w,$h
 $boxes = New-Object System.Collections.Generic.List[object]
 for ($y = [int]($h * 0.05); $y -lt $h; $y++) {
@@ -452,13 +538,13 @@ for ($y = [int]($h * 0.05); $y -lt $h; $y++) {
     }
     $bw = $maxX - $minX + 1
     $bh = $maxY - $minY + 1
-    if ($count -ge 40 -and $bw -ge 8 -and $bw -le 28 -and $bh -ge 8 -and $bh -le 28 -and [Math]::Abs($bw - $bh) -le 8) {
+    if ($count -ge 40 -and $bw -ge $minSize -and $bw -le $maxSize -and $bh -ge $minSize -and $bh -le $maxSize -and [Math]::Abs($bw - $bh) -le $maxDelta) {
       $boxes.Add([PSCustomObject]@{ XR=(($minX+$maxX)/2.0)/$w; YR=(($minY+$maxY)/2.0)/$h; W=$bw; H=$bh; Count=$count }) | Out-Null
     }
   }
 }
 $img.Dispose()
-$boxes | Sort-Object Y | ConvertTo-Json -Compress
+if ($boxes.Count -eq 0) { "[]" } else { $boxes | Sort-Object YR | ConvertTo-Json -Compress }
 """.strip()
         try:
             result = run_powershell(script, ["-ImagePath", windows_path(image)], timeout=30)
@@ -471,6 +557,10 @@ $boxes | Sort-Object Y | ConvertTo-Json -Compress
             if isinstance(raw, dict):
                 raw = [raw]
             points = [(float(item["XR"]), float(item["YR"])) for item in raw]
+            log.info(
+                "蓝色复选框扫描：backend=powershell points=%s",
+                [(round(x, 3), round(y, 3)) for x, y in points],
+            )
             return points
         except Exception as exc:
             log.warning("源消息复选框识别异常：%s", exc)

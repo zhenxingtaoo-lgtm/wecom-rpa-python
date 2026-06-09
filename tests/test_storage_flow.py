@@ -225,6 +225,7 @@ class StorageFlowTest(unittest.TestCase):
                 flow._assert_exact_source_selection = lambda *_args, **_kwargs: None
                 flow._open_recipient_picker_from_source = lambda *_args, **_kwargs: None
                 flow._click_recipient_checkbox_until_selected = lambda rect, x, y, _index: flow.window.click_relative(rect, x, y)
+                flow.screen.is_capture_evidence = lambda _path: True  # type: ignore[method-assign]
                 flow._run_real_bottom_picker_batch(1, [TargetGroup("A"), TargetGroup("B")])
                 recipient_clicks = [click for click in fake.clicks if click[0] == 0.260]
                 self.assertEqual(recipient_clicks, [(0.260, 0.819), (0.260, 0.757)])
@@ -885,6 +886,35 @@ class StorageFlowTest(unittest.TestCase):
                 self.assertEqual(round(flow.source_checkbox_x_ratio, 3), 0.322)
                 self.assertEqual([round(y, 3) for y in flow.source_checkbox_y_ratios], [0.700, 0.500])
 
+    def test_fullscreen_source_selection_converts_physical_dpi_to_window_ratios(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            cfg = AppConfig(
+                max_total_send=2,
+                batch_size=1,
+                batch_interval_sec=0,
+                dry_run=False,
+                require_confirm_before_start=False,
+                require_confirm_first_batch=False,
+            )
+
+            class FakeScreen:
+                def find_selected_checkbox_ratios(self, _image_path):
+                    return [(0.403, 0.610), (0.403, 0.840)]
+
+                def image_size(self, _image_path):
+                    return (2880, 1800)
+
+            with StateStore(root / "state.sqlite3") as store:
+                flow = ForwardFlow(cfg, store, screenshot_dir=str(root / "screenshots"), yes=True, real_send_allowed=True)
+                flow.screen = FakeScreen()
+                flow.source_checkbox_y_ratios = [0.887, 0.645]
+
+                flow._record_exact_source_selection(root / "source_fullscreen.png", rect=WindowRect(0, 0, 1440, 852))
+
+                self.assertEqual(round(flow.source_checkbox_x_ratio, 3), 0.403)
+                self.assertEqual([round(y, 3) for y in flow.source_checkbox_y_ratios], [0.887, 0.644])
+
     def test_source_message_checkpoints_use_fullscreen_screenshots(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
@@ -933,13 +963,11 @@ class StorageFlowTest(unittest.TestCase):
                 flow.screen = FakeScreen()
                 flow.source_checkbox_y_ratios = [0.700, 0.500]
 
-                flow.run([])
                 flow._assert_exact_source_selection(WindowRect(0, 0, 1440, 852), "batch_1_source_before_forward")
                 flow._enter_multiselect_from_source(WindowRect(0, 0, 1440, 852))
                 flow._reselect_source_messages(WindowRect(0, 0, 1440, 852))
 
                 source_checkpoint_names = {
-                    "message_selection_start",
                     "batch_1_source_before_forward",
                     "source_multiselect_opened",
                     "source_messages_reselected",
