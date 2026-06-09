@@ -848,6 +848,24 @@ class StorageFlowTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "数量不是 2 个"):
                     flow._record_exact_source_selection(root / "source.png")
 
+    def test_source_selection_accepts_left_checkbox_column_and_ignores_bottom_toolbar(self):
+        cfg = AppConfig(max_total_send=2, batch_size=1, require_confirm_before_start=False, require_confirm_first_batch=False)
+
+        class FakeScreen:
+            def find_selected_checkbox_ratios(self, *_args, **_kwargs):
+                return [
+                    (0.232, 0.496),
+                    (0.232, 0.669),
+                    (0.327, 0.972),
+                    (0.142, 0.976),
+                    (0.175, 0.973),
+                ]
+
+        flow = ForwardFlow(cfg, store=None, yes=True, real_send_allowed=True)  # type: ignore[arg-type]
+        flow.screen = FakeScreen()
+
+        self.assertEqual(flow._source_selected_checkbox_ratios("source.png"), [(0.232, 0.496), (0.232, 0.669)])
+
     def test_source_selection_falls_back_to_fullscreen_when_window_crop_is_clipped(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)

@@ -787,7 +787,7 @@ class ForwardFlow:
         return [
             (x_ratio, y_ratio)
             for x_ratio, y_ratio in self.screen.find_selected_checkbox_ratios(image_path)
-            if 0.25 <= x_ratio <= 0.50 and y_ratio >= 0.20
+            if 0.18 <= x_ratio <= 0.50 and 0.20 <= y_ratio <= 0.90
         ]
 
     def _source_selected_checkbox_ratios_in_window(self, image_path, rect: WindowRect | None) -> list[tuple[float, float]]:
@@ -832,7 +832,7 @@ class ForwardFlow:
                 continue
             local_x = (abs_x - scaled_left) / scaled_width
             local_y = (abs_y - scaled_top) / scaled_height
-            if 0.25 <= local_x <= 0.50 and local_y >= 0.20:
+            if 0.18 <= local_x <= 0.50 and 0.20 <= local_y <= 0.90:
                 converted.append((local_x, local_y))
         return converted
 
