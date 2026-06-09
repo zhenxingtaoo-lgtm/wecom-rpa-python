@@ -3,13 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import shutil
-import subprocess
 import sys
-import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from .powershell import run_powershell, windows_path
 from .screen import Region, ScreenInspector
 from .wecom_window import WeComWindow, WindowRect
 
@@ -75,17 +73,6 @@ def crop_image(source: Path, target: Path, region: Region) -> Path:
 
 
 def _crop_via_powershell(source: Path, target: Path, region: Region) -> bool:
-    powershell = Path("/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")
-    if not powershell.exists():
-        return False
-    wslpath = shutil.which("wslpath")
-
-    def win_path(path: Path) -> str:
-        if not wslpath:
-            return str(path)
-        converted = subprocess.run([wslpath, "-w", str(path)], check=False, capture_output=True, text=True)
-        return converted.stdout.strip() if converted.returncode == 0 else str(path)
-
     script = """
 param([string]$Source, [string]$Target, [int]$Left, [int]$Top, [int]$Width, [int]$Height)
 Add-Type -AssemblyName System.Drawing
@@ -98,45 +85,30 @@ $g.DrawImage($img, $dstRect, $srcRect, [System.Drawing.GraphicsUnit]::Pixel)
 $bmp.Save($Target, [System.Drawing.Imaging.ImageFormat]::Png)
 $g.Dispose(); $bmp.Dispose(); $img.Dispose()
 """.strip()
-    with tempfile.NamedTemporaryFile("w", suffix=".ps1", encoding="utf-8-sig", delete=False) as f:
-        f.write(script)
-        script_path = Path(f.name)
-    try:
-        result = subprocess.run(
-            [
-                str(powershell),
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                str(script_path),
-                "-Source",
-                win_path(source),
-                "-Target",
-                win_path(target),
-                "-Left",
-                str(region.left),
-                "-Top",
-                str(region.top),
-                "-Width",
-                str(region.width),
-                "-Height",
-                str(region.height),
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-        if result.returncode != 0:
-            log.debug("PowerShell 裁剪失败：%s %s", result.stdout, result.stderr)
-            return False
-        return target.exists()
-    finally:
-        try:
-            script_path.unlink()
-        except OSError:
-            pass
+    result = run_powershell(
+        script,
+        [
+            "-Source",
+            windows_path(source),
+            "-Target",
+            windows_path(target),
+            "-Left",
+            str(region.left),
+            "-Top",
+            str(region.top),
+            "-Width",
+            str(region.width),
+            "-Height",
+            str(region.height),
+        ],
+        timeout=20,
+    )
+    if result is None:
+        return False
+    if result.returncode != 0:
+        log.debug("PowerShell 裁剪失败：%s %s", result.stdout, result.stderr)
+        return False
+    return target.exists()
 
 
 def _rect_from_args(args: argparse.Namespace) -> Region:

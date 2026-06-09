@@ -70,6 +70,7 @@ class ForwardFlow:
         self.source_checkbox_x_ratio = config.source_selection.checkbox_x_ratio
         self.source_checkbox_y_ratios = list(config.source_selection.checkbox_y_ratios)
         self.boundary_reached = False
+        self._progress_total_batches: int | None = None
 
     def _emit_progress(self, event: str, **payload: Any) -> None:
         if self.progress_callback is None:
@@ -138,6 +139,7 @@ class ForwardFlow:
                 log.info("收件人选择策略：search_by_name；按 CSV 群名逐个搜索选择")
 
             batches = split_batches(groups, self.config.batch_size) if groups else []
+            self._progress_total_batches = len(batches)
             for batch_index, batch in enumerate(batches):
                 if self.stop.should_stop():
                     status = "stopped"
@@ -145,7 +147,7 @@ class ForwardFlow:
                 if batch.batch_no == 1 and self.config.require_confirm_first_batch:
                     self._confirm("第一批开始前确认。dry-run 不会真实发送。")
                 log.info("开始处理批次 %s，目标数=%s", batch.batch_no, len(batch.targets))
-                self._run_batch(batch.batch_no, batch.targets, total_batches=len(batches))
+                self._run_batch(batch.batch_no, batch.targets)
                 if self.boundary_reached:
                     for remaining_batch in batches[batch_index + 1 :]:
                         for target in remaining_batch.targets:
@@ -180,6 +182,7 @@ class ForwardFlow:
         return runnable
 
     def _run_batch(self, batch_no: int, targets: list[TargetGroup], *, total_batches: int | None = None) -> None:
+        total_batches = self._progress_total_batches if total_batches is None else total_batches
         self._emit_progress(
             "batch_started",
             batch_no=batch_no,
@@ -330,7 +333,9 @@ class ForwardFlow:
                 raise RuntimeError("无法点击发送按钮")
             self._sleep(2.0)
             evidence = self.screen.save_checkpoint(f"batch_{batch_no}_post_send", region=Region(rect.left, rect.top, rect.width, rect.height))
-            if evidence.suffix.lower() != ".png":
+            is_capture_evidence = getattr(self.screen, "is_capture_evidence", None)
+            evidence_ok = bool(is_capture_evidence(evidence)) if callable(is_capture_evidence) else evidence.suffix.lower() == ".png"
+            if not evidence_ok:
                 self._mark_targets_uncertain(effective_targets, batch_no, "发送后截图证据不可用")
                 raise RuntimeError("发送后截图证据不可用，已标记 uncertain，需人工确认后再续跑")
             if self._has_ocr_text(evidence, ("发送给", "分别发送给")):

@@ -6,6 +6,7 @@ from unittest import mock
 from wecom_rpa.safety import StopController, assert_batch_selection_count, assert_send_limit
 from wecom_rpa.screen import OcrLine, ScreenInspector
 from wecom_rpa.wecom_window import WeComWindow, WindowRect
+from wecom_rpa import powershell
 
 
 class SafetyWindowScreenTest(unittest.TestCase):
@@ -94,15 +95,22 @@ class SafetyWindowScreenTest(unittest.TestCase):
                 stdout = fake
                 stderr = b""
 
-            import subprocess
-            original_run = subprocess.run
-            subprocess.run = lambda *_args, **_kwargs: Result()
-            try:
+            with mock.patch("wecom_rpa.screen.powershell_exe", return_value=Path("powershell.exe")), mock.patch(
+                "wecom_rpa.screen.run_powershell", return_value=Result()
+            ):
                 lines = inspector._ocr_lines_via_windows_ocr(Path("fake.png"))
-            finally:
-                subprocess.run = original_run
 
             self.assertEqual(lines, [OcrLine("大 小 尘", 1, 2, 30, 10)])
+
+    def test_hidden_subprocess_kwargs_hide_windows_console(self):
+        if not hasattr(powershell.subprocess, "STARTUPINFO"):
+            self.skipTest("Windows-only subprocess startup flags")
+
+        with mock.patch.object(powershell.os, "name", "nt"):
+            kwargs = powershell.hidden_subprocess_kwargs()
+
+        self.assertIn("creationflags", kwargs)
+        self.assertIn("startupinfo", kwargs)
 
     def test_parse_paddleocr_result_maps_to_lines(self):
         inspector = ScreenInspector("screenshots")
@@ -139,7 +147,7 @@ class SafetyWindowScreenTest(unittest.TestCase):
             inspector = ScreenInspector("screenshots", paddle_model_root=Path(d) / "models" / "paddleocr")
 
             with self.assertRaisesRegex(FileNotFoundError, "离线模型不完整"):
-                inspector._paddleocr_kwargs()
+                inspector.paddleocr_model_kwargs()
 
 
 if __name__ == "__main__":

@@ -2,40 +2,13 @@ from __future__ import annotations
 
 import json
 import logging
-import shutil
-import subprocess
-import tempfile
 import time
-from pathlib import Path
 from dataclasses import dataclass
 from typing import Any
 
+from .powershell import decode_process_output, powershell_exe, run_powershell
+
 log = logging.getLogger(__name__)
-
-
-def _decode_process_output(data: bytes) -> str:
-    for encoding in ("utf-8-sig", "utf-16", "gbk"):
-        try:
-            return data.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-    return data.decode("utf-8", errors="replace")
-
-
-def _windows_path(path: Path) -> str:
-    wslpath = shutil.which("wslpath")
-    if not wslpath:
-        return str(path)
-    converted = subprocess.run([wslpath, "-w", str(path)], check=False, capture_output=True, text=True)
-    return converted.stdout.strip() if converted.returncode == 0 else str(path)
-
-
-def _powershell_exe() -> Path | None:
-    native = shutil.which("powershell.exe") or shutil.which("powershell")
-    if native:
-        return Path(native)
-    wsl_path = Path("/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")
-    return wsl_path if wsl_path.exists() else None
 
 
 @dataclass(frozen=True)
@@ -133,22 +106,12 @@ class WeComWindow:
             log.debug("激活企业微信窗口失败：%s", exc)
 
     def _locate_via_powershell(self) -> WindowRect | None:
-        powershell = _powershell_exe()
-        if powershell is None:
-            return None
-        script = self._powershell_locator_script()
-        with tempfile.NamedTemporaryFile("w", suffix=".ps1", encoding="utf-8-sig", dir=Path(tempfile.gettempdir()), delete=False) as f:
-            f.write(script)
-            script_path = Path(f.name)
         try:
-            result = subprocess.run(
-                [str(powershell), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", _windows_path(script_path)],
-                check=False,
-                capture_output=True,
-                timeout=20,
-            )
-            stdout = _decode_process_output(result.stdout)
-            stderr = _decode_process_output(result.stderr)
+            result = run_powershell(self._powershell_locator_script(), timeout=20)
+            if result is None:
+                return None
+            stdout = decode_process_output(result.stdout)
+            stderr = decode_process_output(result.stderr)
             if result.returncode != 0 or not stdout.strip():
                 log.info("PowerShell 未找到企业微信窗口：%s", stderr.strip())
                 return None
@@ -167,11 +130,6 @@ class WeComWindow:
         except Exception as exc:
             log.warning("PowerShell 窗口定位失败：%s", exc)
             return None
-        finally:
-            try:
-                script_path.unlink()
-            except OSError:
-                pass
 
     def _powershell_locator_script(self) -> str:
         return """
@@ -321,7 +279,7 @@ $r = New-Object Win32Rect+RECT
     def _activate_last_window(self) -> bool:
         if self._last_hwnd is None:
             return False
-        powershell = _powershell_exe()
+        powershell = powershell_exe()
         if powershell is None:
             return False
         script = """
@@ -344,7 +302,7 @@ Start-Sleep -Milliseconds 80
         return self._run_temp_powershell(script, ["-Hwnd", str(self._last_hwnd)])
 
     def _send_keys_via_powershell(self, keys: str) -> bool:
-        powershell = _powershell_exe()
+        powershell = powershell_exe()
         if powershell is None:
             return False
         script = """
@@ -355,7 +313,7 @@ Add-Type -AssemblyName System.Windows.Forms
         return self._run_temp_powershell(script, ["-Keys", keys])
 
     def _click_point_via_powershell(self, x: int, y: int) -> bool:
-        powershell = _powershell_exe()
+        powershell = powershell_exe()
         if powershell is None:
             return False
         script = """
@@ -387,7 +345,7 @@ Start-Sleep -Milliseconds 50
             return False
 
     def _right_click_point_via_powershell(self, x: int, y: int) -> bool:
-        powershell = _powershell_exe()
+        powershell = powershell_exe()
         if powershell is None:
             return False
         script = """
@@ -409,7 +367,7 @@ Start-Sleep -Milliseconds 50
         return self._run_temp_powershell(script, ["-X", str(x), "-Y", str(y)])
 
     def _mouse_wheel_via_powershell(self, x: int, y: int, delta: int) -> bool:
-        powershell = _powershell_exe()
+        powershell = powershell_exe()
         if powershell is None:
             return False
         script = """
@@ -429,28 +387,14 @@ Start-Sleep -Milliseconds 80
         return self._run_temp_powershell(script, ["-X", str(x), "-Y", str(y), "-Delta", str(delta)])
 
     def _run_temp_powershell(self, script: str, args: list[str]) -> bool:
-        powershell = _powershell_exe()
-        if powershell is None:
-            return False
-        with tempfile.NamedTemporaryFile("w", suffix=".ps1", encoding="utf-8-sig", dir=Path(tempfile.gettempdir()), delete=False) as f:
-            f.write(script)
-            script_path = Path(f.name)
         try:
-            result = subprocess.run(
-                [str(powershell), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", _windows_path(script_path), *args],
-                check=False,
-                capture_output=True,
-                timeout=10,
-            )
+            result = run_powershell(script, args, timeout=10)
+            if result is None:
+                return False
             if result.returncode != 0:
-                log.debug("PowerShell 操作失败：%s", _decode_process_output(result.stderr).strip())
+                log.debug("PowerShell 操作失败：%s", decode_process_output(result.stderr).strip())
                 return False
             return True
         except Exception as exc:
             log.debug("PowerShell 操作异常：%s", exc)
             return False
-        finally:
-            try:
-                script_path.unlink()
-            except OSError:
-                pass

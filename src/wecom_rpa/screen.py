@@ -2,41 +2,15 @@ from __future__ import annotations
 
 import logging
 import json
-import shutil
-import subprocess
 import sys
-import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .powershell import decode_process_output, powershell_exe, run_powershell, windows_path
+
 log = logging.getLogger(__name__)
-
-
-def _decode_process_output(data: bytes) -> str:
-    for encoding in ("utf-8-sig", "utf-16", "gbk"):
-        try:
-            return data.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-    return data.decode("utf-8", errors="replace")
-
-
-def _windows_path(path: Path) -> str:
-    wslpath = shutil.which("wslpath")
-    if not wslpath:
-        return str(path)
-    converted = subprocess.run([wslpath, "-w", str(path)], check=False, capture_output=True, text=True)
-    return converted.stdout.strip() if converted.returncode == 0 else str(path)
-
-
-def _powershell_exe() -> Path | None:
-    native = shutil.which("powershell.exe") or shutil.which("powershell")
-    if native:
-        return Path(native)
-    wsl_path = Path("/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")
-    return wsl_path if wsl_path.exists() else None
 
 
 @dataclass(frozen=True)
@@ -138,6 +112,12 @@ class ScreenInspector:
         except Exception as exc:
             log.debug("读取图片尺寸失败：%s", exc)
             return None
+
+    def paddleocr_model_kwargs(self) -> dict[str, str]:
+        return self._paddleocr_kwargs()
+
+    def is_capture_evidence(self, path: str | Path) -> bool:
+        return Path(path).suffix.lower() == ".png"
 
     def find_template(
         self,
@@ -354,7 +334,7 @@ class ScreenInspector:
         return sorted(lines, key=lambda line: line.top)
 
     def _ocr_lines_via_windows_ocr(self, image_path: Path) -> list[OcrLine]:
-        powershell = _powershell_exe()
+        powershell = powershell_exe()
         if powershell is None:
             return []
         script = r"""
@@ -400,20 +380,14 @@ foreach ($line in $result.Lines) {
 }
 $items | ConvertTo-Json -Compress
 """.strip()
-        with tempfile.NamedTemporaryFile("w", suffix=".ps1", encoding="utf-8-sig", dir=Path(tempfile.gettempdir()), delete=False) as f:
-            f.write(script)
-            script_path = Path(f.name)
         try:
-            result = subprocess.run(
-                [str(powershell), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", _windows_path(script_path), "-ImagePath", _windows_path(image_path)],
-                check=False,
-                capture_output=True,
-                timeout=30,
-            )
-            if result.returncode != 0 or not result.stdout.strip():
-                log.warning("Windows OCR 失败：%s", _decode_process_output(result.stderr).strip())
+            result = run_powershell(script, ["-ImagePath", windows_path(image_path)], timeout=30)
+            if result is None:
                 return []
-            raw = json.loads(_decode_process_output(result.stdout))
+            if result.returncode != 0 or not result.stdout.strip():
+                log.warning("Windows OCR 失败：%s", decode_process_output(result.stderr).strip())
+                return []
+            raw = json.loads(decode_process_output(result.stdout))
             if isinstance(raw, dict):
                 raw = [raw]
             return [
@@ -430,11 +404,6 @@ $items | ConvertTo-Json -Compress
         except Exception as exc:
             log.warning("Windows OCR 异常：%s", exc)
             return []
-        finally:
-            try:
-                script_path.unlink()
-            except OSError:
-                pass
 
     def find_selected_checkbox_ratios(self, image_path: str | Path) -> list[tuple[float, float]]:
         """识别当前窗口截图里已选源消息的蓝色复选框中心点比例。
@@ -444,7 +413,7 @@ $items | ConvertTo-Json -Compress
         image = Path(image_path)
         if not image.exists() or image.suffix.lower() != ".png":
             return []
-        powershell = _powershell_exe()
+        powershell = powershell_exe()
         if powershell is None:
             return []
         script = """
@@ -491,20 +460,14 @@ for ($y = [int]($h * 0.05); $y -lt $h; $y++) {
 $img.Dispose()
 $boxes | Sort-Object Y | ConvertTo-Json -Compress
 """.strip()
-        with tempfile.NamedTemporaryFile("w", suffix=".ps1", encoding="utf-8-sig", dir=Path(tempfile.gettempdir()), delete=False) as f:
-            f.write(script)
-            script_path = Path(f.name)
         try:
-            result = subprocess.run(
-                [str(powershell), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", _windows_path(script_path), "-ImagePath", _windows_path(image)],
-                check=False,
-                capture_output=True,
-                timeout=30,
-            )
-            if result.returncode != 0 or not result.stdout.strip():
-                log.warning("源消息复选框识别失败：%s", _decode_process_output(result.stderr).strip())
+            result = run_powershell(script, ["-ImagePath", windows_path(image)], timeout=30)
+            if result is None:
                 return []
-            raw = json.loads(_decode_process_output(result.stdout))
+            if result.returncode != 0 or not result.stdout.strip():
+                log.warning("源消息复选框识别失败：%s", decode_process_output(result.stderr).strip())
+                return []
+            raw = json.loads(decode_process_output(result.stdout))
             if isinstance(raw, dict):
                 raw = [raw]
             points = [(float(item["XR"]), float(item["YR"])) for item in raw]
@@ -512,11 +475,6 @@ $boxes | Sort-Object Y | ConvertTo-Json -Compress
         except Exception as exc:
             log.warning("源消息复选框识别异常：%s", exc)
             return []
-        finally:
-            try:
-                script_path.unlink()
-            except OSError:
-                pass
 
     def _save_capture(self, subdir: str, name: str, *, region: Region | None = None, fallback_text: str | None = None) -> Path:
         safe_name = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in name).strip("_") or "capture"
@@ -600,15 +558,10 @@ $boxes | Sort-Object Y | ConvertTo-Json -Compress
             return False
 
     def _capture_png_via_powershell(self, path: Path, region: Region | None) -> bool:
-        powershell = _powershell_exe()
+        powershell = powershell_exe()
         if powershell is None:
             return False
-        wslpath = shutil.which("wslpath")
-        out_path = str(path)
-        if wslpath:
-            converted = subprocess.run([wslpath, "-w", str(path)], check=False, capture_output=True, text=True)
-            if converted.returncode == 0:
-                out_path = converted.stdout.strip()
+        out_path = windows_path(path)
         left = 0 if region is None else region.left
         top = 0 if region is None else region.top
         width = 0 if region is None else region.width
@@ -627,17 +580,8 @@ $g.CopyFromScreen($Left, $Top, 0, 0, (New-Object System.Drawing.Size $Width, $He
 $bmp.Save($OutPath, [System.Drawing.Imaging.ImageFormat]::Png)
 $g.Dispose(); $bmp.Dispose()
 """.strip()
-        with tempfile.NamedTemporaryFile("w", suffix=".ps1", encoding="utf-8-sig", dir=Path(tempfile.gettempdir()), delete=False) as f:
-            f.write(script)
-            script_path = Path(f.name)
         try:
-            cmd = [
-                str(powershell),
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                _windows_path(script_path),
+            args = [
                 "-OutPath",
                 out_path,
                 "-Left",
@@ -649,13 +593,13 @@ $g.Dispose(); $bmp.Dispose()
                 "-Height",
                 str(height),
             ]
-            result = subprocess.run(cmd, check=False, capture_output=True, timeout=20)
+            result = run_powershell(script, args, timeout=20)
+            if result is None:
+                return False
             if result.returncode != 0:
-                log.debug("PowerShell 截图失败：%s %s", _decode_process_output(result.stdout), _decode_process_output(result.stderr))
+                log.debug("PowerShell 截图失败：%s %s", decode_process_output(result.stdout), decode_process_output(result.stderr))
                 return False
             return path.exists()
-        finally:
-            try:
-                script_path.unlink()
-            except OSError:
-                pass
+        except Exception as exc:
+            log.debug("PowerShell 截图异常：%s", exc)
+            return False

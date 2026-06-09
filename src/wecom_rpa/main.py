@@ -57,7 +57,7 @@ def main(argv: list[str] | None = None) -> int:
                 ocr_fallback=config.ocr.fallback,
                 paddle_model_root=config.ocr.model_root,
             )
-            kwargs = inspector._paddleocr_kwargs()
+            kwargs = inspector.paddleocr_model_kwargs()
             from paddleocr import PaddleOCR  # type: ignore
 
             try:

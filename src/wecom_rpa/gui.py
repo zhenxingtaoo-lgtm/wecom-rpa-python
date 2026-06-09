@@ -13,6 +13,7 @@ from .config import AppConfig, load_config
 from .forward_flow import FlowResult, ForwardFlow
 from .groups import limit_groups, load_groups_csv
 from .models import TargetGroup, TargetStatus
+from .powershell import terminate_active_powershell
 from .safety import StopController
 from .screen import ScreenInspector
 from .storage import StateStore
@@ -116,7 +117,7 @@ def _check_ocr_model_warning(config: AppConfig, screenshot_dir: Path) -> str | N
         paddle_model_root=config.ocr.model_root,
     )
     try:
-        inspector._paddleocr_kwargs()
+        inspector.paddleocr_model_kwargs()
     except Exception as exc:
         return f"OCR 离线模型检查提示：{exc}"
     return None
@@ -338,11 +339,21 @@ class WeComRpaApp:
 
     def _optional_int(self, value: str) -> int | None:
         value = value.strip()
-        return None if not value else int(value)
+        if not value:
+            return None
+        try:
+            return int(value)
+        except ValueError as exc:
+            raise ValueError(f"覆盖参数必须是整数：{value}") from exc
 
     def _optional_float(self, value: str) -> float | None:
         value = value.strip()
-        return None if not value else float(value)
+        if not value:
+            return None
+        try:
+            return float(value)
+        except ValueError as exc:
+            raise ValueError(f"覆盖参数必须是数字：{value}") from exc
 
     def _check_environment(self) -> None:
         from tkinter import messagebox
@@ -475,14 +486,17 @@ class WeComRpaApp:
         done = threading.Event()
         payload: dict[str, Any] = {"prompt": prompt, "answer": False, "done": done}
         self.ui_queue.put(("confirm", payload))
-        done.wait()
+        if not done.wait(timeout=300):
+            log.error("GUI 确认等待超时，流程停止：%s", prompt)
+            return False
         return bool(payload["answer"])
 
     def _request_stop(self) -> None:
-        if self.stop_controller is None:
-            return
-        self.status_var.set("状态: 停止中")
-        self.stop_controller.request_stop()
+        self.status_var.set("状态: 正在强制停止")
+        if self.stop_controller is not None:
+            self.stop_controller.request_stop()
+        terminate_active_powershell()
+        os._exit(130)
 
     def _process_ui_queue(self) -> None:
         while True:
