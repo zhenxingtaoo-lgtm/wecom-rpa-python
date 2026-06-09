@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from wecom_rpa.gui import GuiRunOptions, inspect_run_setup, validate_real_send_ready
+from wecom_rpa.gui import GuiRunOptions, compute_gui_layout, inspect_run_setup, validate_real_send_ready
 from wecom_rpa.models import TargetGroup, TargetStatus
 from wecom_rpa.storage import StateStore
 
@@ -20,6 +20,23 @@ class GuiSupportTest(unittest.TestCase):
             validate_real_send_ready(dry_run=False, confirm_send=False, confirm_review=True)
 
         validate_real_send_ready(dry_run=False, confirm_send=True, confirm_review=True)
+
+    def test_compute_gui_layout_fits_high_dpi_logical_work_area(self):
+        layout = compute_gui_layout(screen_width=1440, screen_height=852, tk_scaling=2.0)
+
+        self.assertLessEqual(layout.width, 1368)
+        self.assertLessEqual(layout.height, 810)
+        self.assertGreaterEqual(layout.width, 1100)
+        self.assertGreaterEqual(layout.height, 720)
+        self.assertGreaterEqual(layout.base_font_size, 10)
+
+    def test_compute_gui_layout_keeps_small_screens_usable(self):
+        layout = compute_gui_layout(screen_width=1024, screen_height=720, tk_scaling=1.0)
+
+        self.assertLessEqual(layout.width, 984)
+        self.assertLessEqual(layout.height, 680)
+        self.assertLessEqual(layout.min_width, layout.width)
+        self.assertLessEqual(layout.min_height, layout.height)
 
     def test_inspect_run_setup_applies_overrides_without_rewriting_yaml(self):
         with tempfile.TemporaryDirectory() as d:

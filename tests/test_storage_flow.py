@@ -150,6 +150,38 @@ class StorageFlowTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "uncertain"):
                     flow.run(groups)
 
+    def test_resume_with_no_runnable_targets_does_not_touch_wecom(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            groups = [TargetGroup("A"), TargetGroup("B")]
+            cfg = AppConfig(
+                max_total_send=2,
+                batch_size=2,
+                batch_interval_sec=0,
+                dry_run=False,
+                require_confirm_before_start=False,
+                require_confirm_first_batch=False,
+            )
+
+            class NoGuiFlow(ForwardFlow):
+                def _run_batch(self, batch_no, targets):
+                    raise AssertionError("No batch should run when every target is completed")
+
+            with StateStore(root / "state.sqlite3") as store:
+                store.upsert_targets(groups)
+                store.set_status("A", "sent", batch_no=1)
+                store.set_status("B", "skipped", batch_no=1)
+                flow = NoGuiFlow(cfg, store, screenshot_dir=str(root / "screenshots"), yes=True, real_send_allowed=True)
+                flow.window.locate = lambda: (_ for _ in ()).throw(AssertionError("Window lookup should not run"))  # type: ignore[method-assign]
+                flow.screen.save_checkpoint = lambda *_args, **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+                    AssertionError("Screenshot should not run")
+                )
+
+                result = flow.run(groups)
+
+                self.assertEqual(result.status, "completed")
+                self.assertEqual(result.summary, {"sent": 1, "skipped": 1})
+
     def test_partial_real_batch_uses_bottom_recipient_rows(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)

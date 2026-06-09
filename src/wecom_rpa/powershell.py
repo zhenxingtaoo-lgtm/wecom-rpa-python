@@ -24,19 +24,14 @@ def decode_process_output(data: bytes) -> str:
 
 
 def windows_path(path: Path) -> str:
-    wslpath = shutil.which("wslpath")
-    if not wslpath:
-        return str(path)
-    converted = subprocess.run([wslpath, "-w", str(path)], check=False, capture_output=True, text=True)
-    return converted.stdout.strip() if converted.returncode == 0 else str(path)
+    return str(path)
 
 
 def powershell_exe() -> Path | None:
     native = shutil.which("powershell.exe") or shutil.which("powershell")
     if native:
         return Path(native)
-    wsl_path = Path("/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")
-    return wsl_path if wsl_path.exists() else None
+    return None
 
 
 def hidden_subprocess_kwargs() -> dict[str, object]:

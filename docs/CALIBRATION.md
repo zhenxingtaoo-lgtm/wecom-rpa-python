@@ -4,11 +4,12 @@
 
 ## 1. 基础自检
 
-在 WSL/项目目录执行：
+在 Windows 原生项目目录执行：
 
 ```bash
-cd /home/zhenx/.openclaw/workspace/wecom-rpa
-PYTHONPATH=src python3 -m wecom_rpa.calibration probe --crop-suggestions
+cd C:\path\to\wecom-rpa
+$env:PYTHONPATH='src'
+python -m wecom_rpa.calibration probe --crop-suggestions
 ```
 
 成功时会输出：
@@ -42,9 +43,10 @@ PYTHONPATH=src python3 -m wecom_rpa.calibration probe --crop-suggestions
 当用户把企业微信切到对应状态后，可以从窗口截图里裁剪模板：
 
 ```bash
-PYTHONPATH=src python3 -m wecom_rpa.calibration crop \
-  --source screenshots/checkpoints/wecom_window_probe_YYYYMMDD_HHMMSS.png \
-  --out templates/search_box.png \
+$env:PYTHONPATH='src'
+python -m wecom_rpa.calibration crop `
+  --source screenshots/checkpoints/wecom_window_probe_YYYYMMDD_HHMMSS.png `
+  --out templates/search_box.png `
   --left 80 --top 20 --width 220 --height 40
 ```
 

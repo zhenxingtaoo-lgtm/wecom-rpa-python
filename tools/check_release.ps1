@@ -6,9 +6,13 @@ $ErrorActionPreference = "Stop"
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $ReleasePath = Resolve-Path (Join-Path $Root $ReleaseDir)
 $Exe = Join-Path $ReleasePath "app\wecom-rpa.exe"
+$GuiExe = Join-Path $ReleasePath "app\wecom-rpa-gui.exe"
 
 if (-not (Test-Path $Exe)) {
   throw "Release executable not found: $Exe"
+}
+if (-not (Test-Path $GuiExe)) {
+  throw "Release GUI executable not found: $GuiExe"
 }
 
 Push-Location $ReleasePath

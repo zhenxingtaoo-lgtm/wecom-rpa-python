@@ -112,6 +112,16 @@ class SafetyWindowScreenTest(unittest.TestCase):
         self.assertIn("creationflags", kwargs)
         self.assertIn("startupinfo", kwargs)
 
+    def test_windows_path_does_not_use_wslpath(self):
+        with mock.patch.object(powershell.shutil, "which", side_effect=AssertionError("wslpath should not be used")):
+            self.assertEqual(powershell.windows_path(Path("C:/tmp/a.ps1")), str(Path("C:/tmp/a.ps1")))
+
+    def test_powershell_exe_does_not_fallback_to_wsl_mount(self):
+        with mock.patch.object(powershell.shutil, "which", return_value=None), mock.patch.object(
+            powershell.Path, "exists", side_effect=AssertionError("/mnt/c fallback should not be checked")
+        ):
+            self.assertIsNone(powershell.powershell_exe())
+
     def test_parse_paddleocr_result_maps_to_lines(self):
         inspector = ScreenInspector("screenshots")
         raw = [

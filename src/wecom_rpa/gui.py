@@ -49,6 +49,52 @@ class RunInspection:
     ocr_warning: str | None = None
 
 
+@dataclass(frozen=True)
+class GuiLayout:
+    width: int
+    height: int
+    min_width: int
+    min_height: int
+    base_font_size: int
+    title_font_size: int
+
+
+def configure_windows_dpi_awareness() -> None:
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()
+    except Exception as exc:
+        log.debug("设置 Windows DPI awareness 失败：%s", exc)
+
+
+def compute_gui_layout(screen_width: int, screen_height: int, tk_scaling: float) -> GuiLayout:
+    width_margin = 40
+    height_margin = 40
+    max_width = max(860, screen_width - width_margin)
+    max_height = max(560, screen_height - height_margin)
+    width = min(max(1100, int(screen_width * 0.86)), max_width)
+    height = min(max(720, int(screen_height * 0.88)), max_height)
+    min_width = min(980, width)
+    min_height = min(620, height)
+    base_font_size = 10 if tk_scaling >= 1.6 else 9
+    if tk_scaling >= 2.3:
+        base_font_size = 11
+    return GuiLayout(
+        width=width,
+        height=height,
+        min_width=min_width,
+        min_height=min_height,
+        base_font_size=base_font_size,
+        title_font_size=base_font_size + 5,
+    )
+
+
 def validate_real_send_ready(*, dry_run: bool, confirm_send: bool, confirm_review: bool) -> None:
     if dry_run:
         return
@@ -138,17 +184,37 @@ class QueueLogHandler(logging.Handler):
 
 class WeComRpaApp:
     def __init__(self) -> None:
+        configure_windows_dpi_awareness()
         import tkinter as tk
+        import tkinter.font as tkfont
         from tkinter import ttk
 
         self.tk = tk
+        self.tkfont = tkfont
         self.ttk = ttk
         self.root = tk.Tk()
         self.root.title("企业微信批量转发 RPA")
-        self.root.geometry("980x680")
-        self.root.minsize(860, 560)
+        self.layout = compute_gui_layout(
+            self.root.winfo_screenwidth(),
+            self.root.winfo_screenheight(),
+            float(self.root.tk.call("tk", "scaling")),
+        )
+        self._configure_fonts()
+        self.root.geometry(f"{self.layout.width}x{self.layout.height}")
+        self.root.minsize(self.layout.min_width, self.layout.min_height)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.ttk.Style().configure("Danger.TButton", foreground="#b00020")
+        self.dpi_info = (
+            "GUI DPI 信息："
+            f"screen={self.root.winfo_screenwidth()}x{self.root.winfo_screenheight()} "
+            f"tk_scaling={float(self.root.tk.call('tk', 'scaling')):.3f} "
+            f"window={self.layout.width}x{self.layout.height} "
+            f"min={self.layout.min_width}x{self.layout.min_height}"
+        )
+        log.info(
+            "%s",
+            self.dpi_info,
+        )
 
         self.ui_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.worker: threading.Thread | None = None
@@ -176,8 +242,22 @@ class WeComRpaApp:
         self.latest_screenshot_var = tk.StringVar(value="最近截图: -")
 
         self._build_ui()
+        self._append_log(self.dpi_info)
         self._set_running(False)
         self.root.after(100, self._process_ui_queue)
+
+    def _configure_fonts(self) -> None:
+        base_size = self.layout.base_font_size
+        title_size = self.layout.title_font_size
+        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont", "TkCaptionFont", "TkSmallCaptionFont"):
+            try:
+                font = self.tkfont.nametofont(name)
+                current_size = abs(int(font.cget("size")))
+                if current_size < base_size:
+                    font.configure(size=base_size)
+            except Exception:
+                continue
+        self.title_font = ("", title_size, "bold")
 
     def _default_config_path(self) -> Path:
         preferred = Path("config/real_send_until_daxiaochen.yaml")
@@ -190,18 +270,20 @@ class WeComRpaApp:
         ttk = self.ttk
 
         self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(1, weight=0)
         self.root.rowconfigure(2, weight=1)
 
         header = ttk.Frame(self.root, padding=(12, 10))
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(0, weight=1)
-        ttk.Label(header, text="企业微信批量转发 RPA", font=("", 15, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Label(header, text="企业微信批量转发 RPA", font=self.title_font).grid(row=0, column=0, sticky="w")
         ttk.Label(header, textvariable=self.status_var).grid(row=0, column=1, sticky="e")
 
         middle = ttk.Frame(self.root, padding=(12, 0, 12, 8))
         middle.grid(row=1, column=0, sticky="nsew")
         middle.columnconfigure(0, weight=3)
         middle.columnconfigure(1, weight=2)
+        middle.rowconfigure(0, weight=1)
 
         params = ttk.LabelFrame(middle, text="参数设置", padding=10)
         params.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
@@ -238,6 +320,7 @@ class WeComRpaApp:
         right = ttk.LabelFrame(middle, text="运行摘要 / 准备检查", padding=10)
         right.grid(row=0, column=1, sticky="nsew")
         right.columnconfigure(0, weight=1)
+        right.rowconfigure(0, weight=1)
         ttk.Label(right, textvariable=self.summary_var, justify="left", anchor="nw").grid(row=0, column=0, sticky="nsew")
         ttk.Separator(right).grid(row=1, column=0, sticky="ew", pady=8)
         ttk.Checkbutton(right, text="已确认企业微信窗口可见，源消息已手动勾选", variable=self.source_ready_var, command=self._invalidate_check).grid(row=2, column=0, sticky="w")
@@ -250,7 +333,7 @@ class WeComRpaApp:
         log_frame.rowconfigure(2, weight=1)
         ttk.Label(log_frame, textvariable=self.progress_var).grid(row=0, column=0, sticky="w")
         ttk.Label(log_frame, textvariable=self.latest_screenshot_var).grid(row=1, column=0, sticky="w")
-        self.log_text = tk.Text(log_frame, height=12, wrap="word", state="disabled")
+        self.log_text = tk.Text(log_frame, height=10, wrap="word", state="disabled")
         self.log_text.grid(row=2, column=0, sticky="nsew")
         scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
         scrollbar.grid(row=2, column=1, sticky="ns")
@@ -471,6 +554,7 @@ class WeComRpaApp:
         self.file_log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
         root_logger.addHandler(self.queue_log_handler)
         root_logger.addHandler(self.file_log_handler)
+        log.info("%s", self.dpi_info)
 
     def _uninstall_logging(self) -> None:
         root_logger = logging.getLogger()

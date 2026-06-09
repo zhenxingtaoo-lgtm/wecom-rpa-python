@@ -108,6 +108,11 @@ class ForwardFlow:
         try:
             self._emit_progress("run_started", total_targets=len(groups), dry_run=self.config.dry_run)
             groups = self._resume_targets(groups)
+            if not groups:
+                log.info("没有待处理目标，跳过企业微信窗口检查和截图操作")
+                result = FlowResult(run_id=run_id, status=status, summary=self.store.summary())
+                self._emit_progress("run_finished", run_id=run_id, status=status, summary=result.summary)
+                return result
             rect = self.window.locate()
             selection_shot = self.screen.save_checkpoint("message_selection_start", region=None)
             if not self.config.dry_run and rect:

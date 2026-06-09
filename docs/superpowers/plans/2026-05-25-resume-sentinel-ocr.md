@@ -60,5 +60,5 @@
 
 ### Verification
 
-- [ ] Run `wsl.exe -e bash -lc "cd /mnt/c/Users/zhenx/Documents/Codex/wecom-rpa-v2026.5.24 && PYTHONPATH=src python3 -m unittest discover -s tests -v"`.
+- [ ] Run `python -m unittest discover -s tests -v`.
 - [ ] Confirm all tests pass or only existing optional dependency skips remain.

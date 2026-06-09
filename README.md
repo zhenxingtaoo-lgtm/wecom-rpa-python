@@ -45,7 +45,7 @@ $env:UV_HTTP_TIMEOUT='120'
 .\.tools\uv.exe pip install --python .\.venv-paddle-win\Scripts\python.exe -i https://pypi.tuna.tsinghua.edu.cn/simple PyYAML Pillow numpy==1.26.4 opencv-python==4.6.0.66 paddlepaddle==2.6.2 paddleocr==2.7.3 mss pyautogui
 ```
 
-WSL 中的 PaddlePaddle 预编译包可能因为 CPU 指令集触发 `Illegal instruction`。真实 GUI 调试建议使用上面的 Windows 原生环境运行。
+真实 GUI 调试和客户机运行均按 Windows 原生环境处理。
 
 GUI 启动：
 
@@ -90,17 +90,6 @@ $env:PYTHONPATH='src'
   --i-understand-this-will-send-messages
 ```
 
-WSL dry-run 仍可使用：
-
-```bash
-python -m wecom_rpa.main \
-  --config config/config.example.yaml \
-  --groups data/groups.example.csv \
-  --db data/wecom_rpa.sqlite3 \
-  --yes \
-  --dry-run
-```
-
 真实发送前请确认企业微信窗口可见、待转发源消息已正确选中，并确保配置文件中的源消息坐标、转发按钮坐标、哨兵名称和 OCR 模型目录与当前窗口布局一致。实机推荐使用 `config/real_send_until_daxiaochen.yaml` 或按校准结果维护自己的真实发送配置。
 
 ## 配置
@@ -139,7 +128,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\check_release.ps1
 - `build\WeComRPA.zip`：发给客户测试的压缩包。
 
 客户电脑只需要解压整个目录，先运行 `check-ocr-models.bat` 验证离线 OCR 模型，再按 `README_USER.md` 运行 dry-run 或真实发送脚本。企业微信 Windows 客户端仍需客户本机提前安装并登录。
-打包目录会同时包含 CLI 可执行文件和 GUI 可执行文件，推荐普通用户优先使用 `run-gui.bat`。
+打包目录的 `app/` 子目录会同时包含 CLI 可执行文件和 GUI 可执行文件；根目录提供 `run-gui.bat` 作为普通用户入口。
 
 ## 群列表 CSV
 
@@ -219,7 +208,7 @@ recipient_selection:
 
 详见 `docs/CALIBRATION.md`。
 
-1. 安装可选依赖：`pip install -e .[windows]`。在 WSL 环境下，工具也可通过 Windows PowerShell 做截图和窗口定位。
+1. 安装可选依赖：`pip install -e .[windows]`。实机校准只支持 Windows 原生桌面环境。
 2. 打开企业微信 Windows 客户端，保持主窗口可见。
 3. 运行校准截图自检，确认 `screenshots/checkpoints/` 和 `screenshots/calibration/` 下能保存 PNG。
 4. 将按钮模板图片放入 `templates/`，建议文件名：
