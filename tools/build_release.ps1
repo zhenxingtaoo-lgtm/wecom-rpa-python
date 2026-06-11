@@ -78,7 +78,9 @@ try {
   Copy-Item -Recurse -Force (Join-Path $DistRoot "wecom-rpa") $AppRoot
   Copy-Item -Recurse -Force (Join-Path $DistRoot "wecom-rpa-gui\*") $AppRoot
   Copy-Item -Recurse -Force config (Join-Path $ReleaseRoot "config")
-  Copy-Item -Recurse -Force templates (Join-Path $ReleaseRoot "templates")
+  if (Test-Path "templates") {
+    Copy-Item -Recurse -Force templates (Join-Path $ReleaseRoot "templates")
+  }
   New-Item -ItemType Directory -Force (Join-Path $ReleaseRoot "data") | Out-Null
   Copy-Item -Force data\*.csv (Join-Path $ReleaseRoot "data")
   Copy-Item -Recurse -Force $ModelSource (Join-Path $ReleaseRoot "models\paddleocr")

@@ -85,6 +85,16 @@ class ScreenInspector:
     def save_checkpoint(self, name: str, region: Region | None = None) -> Path:
         return self._save_capture("checkpoints", name, region=region)
 
+    def save_fullscreen_checkpoint(self, name: str) -> Path:
+        safe_name = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in name).strip("_") or "capture"
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        target = self.screenshot_dir / "checkpoints" / f"{safe_name}_{stamp}.png"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if self._capture_png_via_powershell(target, None) and target.exists():
+            log.info("保存 DPI-aware 全屏截图：%s", target)
+            return target
+        return self._save_capture("checkpoints", name, region=None)
+
     def save_error(self, name: str, reason: str, region: Region | None = None) -> Path:
         path = self._save_capture("errors", name, region=region, fallback_text=f"错误截图占位：{reason}\n")
         log.error("保存错误截图：%s reason=%s", path, reason)
@@ -295,11 +305,20 @@ class ScreenInspector:
     def _resolve_paddle_model_root(self) -> Path | None:
         candidates: list[Path] = []
         if self.paddle_model_root is not None:
-            return self.paddle_model_root.resolve()
+            configured = self.paddle_model_root
+            configured_candidates = [configured]
+            if not configured.is_absolute():
+                configured_candidates.append(Path.cwd() / configured)
+            for candidate in configured_candidates:
+                if candidate.exists():
+                    return candidate.resolve()
+            log.warning("PaddleOCR 配置模型目录不存在，将尝试默认缓存目录：%s", configured)
         candidates.append(Path.cwd() / "models" / "paddleocr")
+        candidates.append(Path.home() / ".paddleocr" / "whl")
         if getattr(sys, "frozen", False):
             executable_dir = Path(sys.executable).resolve().parent
             candidates.append(executable_dir / "models" / "paddleocr")
+            candidates.append(executable_dir.parent / "models" / "paddleocr")
             candidates.append(Path(getattr(sys, "_MEIPASS", executable_dir)) / "models" / "paddleocr")
         for candidate in candidates:
             if candidate.exists():
@@ -420,15 +439,95 @@ $items | ConvertTo-Json -Compress
             return points
         return self._find_selected_checkbox_ratios_via_powershell(image)
 
+    def find_checkbox_outline_ratios(self, image_path: str | Path) -> list[tuple[float, float]]:
+        """识别未勾选复选框的灰色方框轮廓中心点比例。"""
+        image = Path(image_path)
+        if not image.exists() or image.suffix.lower() != ".png":
+            return []
+        try:
+            from PIL import Image  # type: ignore
+        except Exception as exc:
+            log.debug("Pillow 不可用，跳过灰色复选框轮廓扫描：%s", exc)
+            return []
+        try:
+            with Image.open(image) as raw:
+                bitmap = raw.convert("RGB")
+                width, height = bitmap.size
+                pixels = bitmap.load()
+                visited: set[tuple[int, int]] = set()
+                scale = max(width / 1440.0, height / 900.0, 1.0)
+                min_size = max(10, int(10 * scale))
+                max_size = max(42, int(36 * scale))
+                max_delta = max(10, int(8 * scale))
+                points: list[tuple[float, float]] = []
+                for y in range(0, height):
+                    for x in range(0, width):
+                        if (x, y) in visited:
+                            continue
+                        r, g, b = pixels[x, y]
+                        if not self._is_checkbox_outline_gray(r, g, b):
+                            visited.add((x, y))
+                            continue
+                        queue: deque[tuple[int, int]] = deque([(x, y)])
+                        visited.add((x, y))
+                        min_x = max_x = x
+                        min_y = max_y = y
+                        count = 0
+                        while queue:
+                            px, py = queue.popleft()
+                            count += 1
+                            min_x = min(min_x, px)
+                            max_x = max(max_x, px)
+                            min_y = min(min_y, py)
+                            max_y = max(max_y, py)
+                            for nx, ny in ((px + 1, py), (px - 1, py), (px, py + 1), (px, py - 1)):
+                                if nx < 0 or ny < 0 or nx >= width or ny >= height or (nx, ny) in visited:
+                                    continue
+                                nr, ng, nb = pixels[nx, ny]
+                                if self._is_checkbox_outline_gray(nr, ng, nb):
+                                    visited.add((nx, ny))
+                                    queue.append((nx, ny))
+                        box_width = max_x - min_x + 1
+                        box_height = max_y - min_y + 1
+                        if (
+                            count >= 20
+                            and min_size <= box_width <= max_size
+                            and min_size <= box_height <= max_size
+                            and abs(box_width - box_height) <= max_delta
+                        ):
+                            points.append((((min_x + max_x) / 2.0) / width, ((min_y + max_y) / 2.0) / height))
+                points = self._dedupe_ratio_points(points)
+                log.info(
+                    "灰色复选框轮廓扫描：backend=pillow image=%sx%s points=%s",
+                    width,
+                    height,
+                    [(round(x, 3), round(y, 3)) for x, y in points],
+                )
+                return sorted(points, key=lambda point: point[1])
+        except Exception as exc:
+            log.debug("Pillow 灰色复选框轮廓扫描失败：%s", exc)
+            return []
+
     def _checkbox_size_limits(self, width: int, height: int) -> tuple[int, int, int]:
         scale = max(width / 1440.0, height / 900.0, 1.0)
         min_size = max(8, int(7 * scale))
-        max_size = max(28, int(24 * scale))
+        max_size = max(42, int(32 * scale))
         max_delta = max(8, int(6 * scale))
         return min_size, max_size, max_delta
 
     def _is_selected_checkbox_blue(self, r: int, g: int, b: int) -> bool:
         return b > 170 and 90 < g < 190 and r < 100
+
+    def _is_checkbox_outline_gray(self, r: int, g: int, b: int) -> bool:
+        return 90 <= r <= 205 and 90 <= g <= 205 and 90 <= b <= 205 and max(r, g, b) - min(r, g, b) <= 32
+
+    def _dedupe_ratio_points(self, points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        deduped: list[tuple[float, float]] = []
+        for point in sorted(points, key=lambda item: (item[1], item[0])):
+            if any(abs(point[0] - existing[0]) <= 0.006 and abs(point[1] - existing[1]) <= 0.006 for existing in deduped):
+                continue
+            deduped.append(point)
+        return deduped
 
     def _find_selected_checkbox_ratios_via_pillow(self, image_path: Path) -> list[tuple[float, float]]:
         try:
@@ -445,7 +544,7 @@ $items | ConvertTo-Json -Compress
                 min_size, max_size, max_delta = self._checkbox_size_limits(width, height)
                 points: list[tuple[float, float]] = []
                 start_y = int(height * 0.05)
-                start_x = int(width * 0.12)
+                start_x = int(width * 0.02)
                 end_x = int(width * 0.95)
                 for y in range(start_y, height):
                     for x in range(start_x, end_x):
@@ -658,10 +757,19 @@ if ($boxes.Count -eq 0) { "[]" } else { $boxes | Sort-Object YR | ConvertTo-Json
         height = 0 if region is None else region.height
         script = """
 param([string]$OutPath, [int]$Left, [int]$Top, [int]$Width, [int]$Height)
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class DpiAwareCapture {
+  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  [DllImport("shcore.dll")] public static extern int SetProcessDpiAwareness(int value);
+}
+"@
+try { [void][DpiAwareCapture]::SetProcessDpiAwareness(2) } catch { try { [void][DpiAwareCapture]::SetProcessDPIAware() } catch {} }
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 if ($Width -le 0 -or $Height -le 0) {
-  $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+  $bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
   $Left = $bounds.Left; $Top = $bounds.Top; $Width = $bounds.Width; $Height = $bounds.Height
 }
 $bmp = New-Object System.Drawing.Bitmap $Width, $Height

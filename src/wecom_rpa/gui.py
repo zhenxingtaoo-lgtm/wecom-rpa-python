@@ -5,6 +5,8 @@ import os
 import queue
 import subprocess
 import threading
+import time
+from datetime import datetime
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -47,6 +49,17 @@ class RunInspection:
     has_uncertain: bool
     uncertain_targets: list[str]
     ocr_warning: str | None = None
+    source_check: SourceSelectionInspection | None = None
+
+
+@dataclass(frozen=True)
+class SourceSelectionInspection:
+    selected: bool
+    screenshot: Path
+    expected_count: int
+    matched_count: int
+    points: list[tuple[float, float]]
+    forward_button_ratio: tuple[float, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -167,6 +180,132 @@ def _check_ocr_model_warning(config: AppConfig, screenshot_dir: Path) -> str | N
     except Exception as exc:
         return f"OCR 离线模型检查提示：{exc}"
     return None
+
+
+def inspect_source_selection(config: AppConfig, screenshot_dir: Path, rect: Any) -> SourceSelectionInspection:
+    inspector = ScreenInspector(
+        screenshot_dir,
+        template_threshold=config.vision.template_threshold,
+        ocr_engine=config.ocr.engine,
+        ocr_lang=config.ocr.lang,
+        ocr_fallback=config.ocr.fallback,
+        paddle_model_root=config.ocr.model_root,
+    )
+    screenshot = inspector.save_fullscreen_checkpoint("gui_source_selection_check")
+    expected = len(config.source_selection.checkbox_y_ratios)
+    if screenshot.suffix.lower() != ".png":
+        return SourceSelectionInspection(
+            selected=False,
+            screenshot=screenshot,
+            expected_count=expected,
+            matched_count=0,
+            points=[],
+        )
+
+    image_size = inspector.image_size(screenshot)
+    points = convert_fullscreen_checkbox_ratios_to_window(inspector, screenshot, rect, image_size)
+    fullscreen_source_points = [
+        (x_ratio, y_ratio)
+        for x_ratio, y_ratio in inspector.find_selected_checkbox_ratios(screenshot)
+        if 0.18 <= x_ratio <= 0.50 and 0.12 <= y_ratio <= 0.85
+    ]
+    x_tolerance = 0.06
+    y_tolerance = 0.04
+    matched = 0
+    for expected_y in config.source_selection.checkbox_y_ratios:
+        if any(
+            abs(x_ratio - config.source_selection.checkbox_x_ratio) <= x_tolerance
+            and abs(y_ratio - expected_y) <= y_tolerance
+            for x_ratio, y_ratio in points
+        ):
+            matched += 1
+    if matched != expected and len(fullscreen_source_points) >= expected:
+        points = fullscreen_source_points
+        matched = expected
+    forward_button_ratio = detect_forward_button_ratio(inspector, screenshot, rect)
+    return SourceSelectionInspection(
+        selected=matched == expected,
+        screenshot=screenshot,
+        expected_count=expected,
+        matched_count=matched,
+        points=points,
+        forward_button_ratio=forward_button_ratio,
+    )
+
+
+def detect_forward_button_ratio(inspector: ScreenInspector, image_path: Path, rect: Any) -> tuple[float, float] | None:
+    try:
+        lines = inspector.ocr_lines(image_path=image_path)
+    except Exception as exc:
+        log.warning("逐条转发按钮 OCR 识别失败：%s", exc)
+        return None
+    image_size = inspector.image_size(image_path)
+    if not image_size:
+        return None
+    image_width, image_height = image_size
+
+    candidates: list[tuple[float, float, str]] = []
+    for line in lines:
+        text = line.text.replace(" ", "")
+        if "逐条转发" not in text:
+            continue
+        center_x = line.left + line.width / 2.0
+        center_y = line.top + line.height / 2.0
+        local_x = (center_x - rect.left) / rect.width
+        local_y = (center_y - rect.top) / rect.height
+        if 0.15 <= local_x <= 0.85 and 0.70 <= local_y <= 0.98:
+            candidates.append((local_x, local_y, line.text))
+
+    if not candidates:
+        log.warning(
+            "未通过 OCR 识别到逐条转发按钮；ocr_texts=%s",
+            [line.text for line in lines if line.top >= image_height * 0.60][:30],
+        )
+        return None
+
+    x_ratio, y_ratio, text = sorted(candidates, key=lambda item: item[1], reverse=True)[0]
+    # The label is below the icon; clicking a little above its center is more stable.
+    click_y = max(0.02, y_ratio - 0.025)
+    log.info("识别到逐条转发按钮：text=%s ratio=(%.3f, %.3f) click=(%.3f, %.3f)", text, x_ratio, y_ratio, x_ratio, click_y)
+    return (x_ratio, click_y)
+
+
+def convert_fullscreen_checkbox_ratios_to_window(
+    inspector: ScreenInspector,
+    image_path: Path,
+    rect: Any,
+    image_size: tuple[int, int] | None,
+) -> list[tuple[float, float]]:
+    if not image_size or image_size[0] <= 0 or image_size[1] <= 0 or rect.width <= 0 or rect.height <= 0:
+        return []
+    image_width, image_height = image_size
+    converted: list[tuple[float, float]] = []
+    scales = {1.0}
+    if image_width > rect.width * 1.25:
+        scales.add(image_width / rect.width)
+    if image_height > rect.height * 1.25:
+        scales.add(image_height / rect.height)
+    raw_points = list(inspector.find_selected_checkbox_ratios(image_path))
+    seen: set[tuple[int, int]] = set()
+    for scale in scales:
+        scaled_left = rect.left * scale
+        scaled_top = rect.top * scale
+        scaled_width = rect.width * scale
+        scaled_height = rect.height * scale
+        for x_ratio, y_ratio in raw_points:
+            abs_x = x_ratio * image_width
+            abs_y = y_ratio * image_height
+            if not (scaled_left <= abs_x <= scaled_left + scaled_width and scaled_top <= abs_y <= scaled_top + scaled_height):
+                continue
+            local_x = (abs_x - scaled_left) / scaled_width
+            local_y = (abs_y - scaled_top) / scaled_height
+            if 0.18 <= local_x <= 0.50 and 0.20 <= local_y <= 0.90:
+                key = (round(local_x * 10000), round(local_y * 10000))
+                if key in seen:
+                    continue
+                seen.add(key)
+                converted.append((local_x, local_y))
+    return converted
 
 
 class QueueLogHandler(logging.Handler):
@@ -321,9 +460,16 @@ class WeComRpaApp:
         right.grid(row=0, column=1, sticky="nsew")
         right.columnconfigure(0, weight=1)
         right.rowconfigure(0, weight=1)
-        ttk.Label(right, textvariable=self.summary_var, justify="left", anchor="nw").grid(row=0, column=0, sticky="nsew")
+        self.summary_label = ttk.Label(
+            right,
+            textvariable=self.summary_var,
+            justify="left",
+            anchor="nw",
+            wraplength=360,
+        )
+        self.summary_label.grid(row=0, column=0, sticky="nsew")
         ttk.Separator(right).grid(row=1, column=0, sticky="ew", pady=8)
-        ttk.Checkbutton(right, text="已确认企业微信窗口可见，源消息已手动勾选", variable=self.source_ready_var, command=self._invalidate_check).grid(row=2, column=0, sticky="w")
+        ttk.Checkbutton(right, text="源消息勾选检测通过", variable=self.source_ready_var, state="disabled").grid(row=2, column=0, sticky="w")
         self.check_button = ttk.Button(right, text="检查环境", command=self._check_environment)
         self.check_button.grid(row=3, column=0, sticky="w", pady=(10, 0))
 
@@ -438,30 +584,112 @@ class WeComRpaApp:
         except ValueError as exc:
             raise ValueError(f"覆盖参数必须是数字：{value}") from exc
 
+    def _check_log(self, message: str, log_file: Path | None = None) -> None:
+        line = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} CHECK {message}"
+        self._append_log(line)
+        log.info("%s", message)
+        target = log_file or Path(self.log_file_var.get())
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except Exception as exc:
+            log.debug("写入检查日志失败：%s", exc)
+
     def _check_environment(self) -> None:
         from tkinter import messagebox
 
+        start = time.monotonic()
+        options: GuiRunOptions | None = None
         try:
+            self._clear_log()
             options = self._options_from_form()
+            self._check_log(
+                "开始检查环境："
+                f"mode={'dry_run' if options.dry_run else 'real_send'} "
+                f"config={options.config_path} groups={options.groups_path} db={options.db_path}",
+                options.log_file,
+            )
+            self._check_log("加载配置、群列表和状态库", options.log_file)
             inspection = inspect_run_setup(options)
-            window_found = WeComWindow(inspection.config.window.title_keyword, anchors=inspection.config.window.anchors).locate() is not None
+            self._check_log(
+                "配置检查完成："
+                f"groups={inspection.original_count} limited={inspection.limited_count} "
+                f"batch_size={inspection.config.batch_size} max_total_send={inspection.config.max_total_send} "
+                f"uncertain={len(inspection.uncertain_targets)}",
+                options.log_file,
+            )
+            self._check_log("开始定位企业微信窗口", options.log_file)
+            rect = WeComWindow(inspection.config.window.title_keyword, anchors=inspection.config.window.anchors).locate()
+            window_found = rect is not None
             if not options.dry_run and not window_found:
                 raise RuntimeError("真实发送前必须能找到企业微信窗口")
-            if not self.source_ready_var.get():
-                raise RuntimeError("请先勾选：已确认企业微信窗口可见，源消息已手动勾选")
+            if rect is None:
+                raise RuntimeError("检查失败：未找到企业微信窗口，无法截图确认源消息是否已勾选。")
+            self._check_log(f"企业微信窗口已找到：rect={rect}", options.log_file)
+            self._check_log("开始截图并识别源消息蓝色勾选框和逐条转发按钮", options.log_file)
+            source_check = inspect_source_selection(inspection.config, options.screenshot_dir, rect)
+            self._check_log(
+                "源消息勾选检测结果："
+                f"selected={source_check.selected} matched={source_check.matched_count}/{source_check.expected_count} "
+                f"points={[(round(x, 3), round(y, 3)) for x, y in source_check.points]} "
+                f"screenshot={source_check.screenshot}",
+                options.log_file,
+            )
+            self._check_log(f"逐条转发按钮识别结果：ratio={source_check.forward_button_ratio}", options.log_file)
+            if source_check.selected and source_check.forward_button_ratio is not None:
+                source_points = sorted(source_check.points, key=lambda item: item[1], reverse=True)
+                updated_source_selection = replace(
+                    inspection.config.source_selection,
+                    checkbox_x_ratio=sum(x for x, _ in source_points) / len(source_points),
+                    checkbox_y_ratios=[y for _x, y in source_points],
+                    forward_button_ratio=list(source_check.forward_button_ratio),
+                )
+                inspection = replace(
+                    inspection,
+                    config=replace(inspection.config, source_selection=updated_source_selection),
+                )
+                self._check_log(
+                    "源消息坐标已记录到本次运行配置："
+                    f"x={updated_source_selection.checkbox_x_ratio:.3f} "
+                    f"y={[round(y, 3) for y in updated_source_selection.checkbox_y_ratios]}",
+                    options.log_file,
+                )
+            inspection = replace(inspection, source_check=source_check)
+            self.source_ready_var.set(source_check.selected)
+            if not source_check.selected:
+                points = [(round(x, 3), round(y, 3)) for x, y in source_check.points]
+                raise RuntimeError(
+                    "检查失败：未检测到配置要求的待转发消息蓝色勾选框。"
+                    f" expected={source_check.expected_count} matched={source_check.matched_count} "
+                    f"points={points} screenshot={source_check.screenshot}"
+                )
+            if source_check.forward_button_ratio is None:
+                raise RuntimeError(
+                    "检查失败：未识别到“逐条转发”按钮，不能继续执行。"
+                    f" screenshot={source_check.screenshot}"
+                )
             self.current_inspection = inspection
             self.last_check_passed = not inspection.has_uncertain
             self._render_summary(inspection, window_found=window_found)
             self._refresh_start_button()
+            self._bring_to_front()
+            elapsed = time.monotonic() - start
+            self._check_log(f"检查完成：status=ok elapsed={elapsed:.2f}s", options.log_file)
             if inspection.has_uncertain:
                 messagebox.showwarning("存在 uncertain", "状态库存在 uncertain 目标，请人工复查后再运行。")
             elif inspection.ocr_warning:
                 messagebox.showwarning("OCR 检查提示", inspection.ocr_warning)
+            else:
+                messagebox.showinfo("检查完成", f"源消息勾选检测通过：matched={source_check.matched_count}/{source_check.expected_count}")
         except Exception as exc:
             self.current_inspection = None
             self.last_check_passed = False
-            self.summary_var.set(f"检查失败：{exc}")
+            self.summary_var.set("检查失败：请查看弹窗提示；截图已保存到 screenshots/checkpoints。")
             self._refresh_start_button()
+            self._bring_to_front()
+            elapsed = time.monotonic() - start
+            self._check_log(f"检查失败：elapsed={elapsed:.2f}s error={exc}", options.log_file if options else None)
             messagebox.showerror("检查失败", str(exc))
 
     def _render_summary(self, inspection: RunInspection, *, window_found: bool) -> None:
@@ -471,6 +699,17 @@ class WeComRpaApp:
             sentinel_text = "已启用 " + "、".join(sentinel.names)
         uncertain = "无" if not inspection.uncertain_targets else "、".join(inspection.uncertain_targets)
         ocr_text = inspection.ocr_warning or "无"
+        source_text = "未检查"
+        if inspection.source_check is not None:
+            forward_text = "未识别"
+            if inspection.source_check.forward_button_ratio is not None:
+                fx, fy = inspection.source_check.forward_button_ratio
+                forward_text = f"forward=({fx:.3f},{fy:.3f})"
+            source_text = (
+                f"{'通过' if inspection.source_check.selected else '失败'} "
+                f"{inspection.source_check.matched_count}/{inspection.source_check.expected_count} "
+                f"{forward_text} screenshot={inspection.source_check.screenshot.name}"
+            )
         self.summary_var.set(
             "\n".join(
                 [
@@ -483,6 +722,7 @@ class WeComRpaApp:
                     f"哨兵: {sentinel_text}",
                     f"uncertain: {uncertain}",
                     f"企业微信窗口: {'已找到' if window_found else '未找到'}",
+                    f"源消息勾选检测: {source_text}",
                     f"OCR 提示: {ocr_text}",
                 ]
             )
@@ -491,6 +731,7 @@ class WeComRpaApp:
     def _invalidate_check(self) -> None:
         self.last_check_passed = False
         self.current_inspection = None
+        self.source_ready_var.set(False)
         self._refresh_start_button()
 
     def _refresh_start_button(self) -> None:
@@ -499,6 +740,16 @@ class WeComRpaApp:
             return
         state = "normal" if self.last_check_passed and self.current_inspection and not self.current_inspection.has_uncertain else "disabled"
         self.start_button.configure(state=state)
+
+    def _bring_to_front(self) -> None:
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.attributes("-topmost", True)
+            self.root.after(250, lambda: self.root.attributes("-topmost", False))
+            self.root.focus_force()
+        except Exception as exc:
+            log.debug("恢复 GUI 前台失败：%s", exc)
 
     def _start_run(self) -> None:
         from tkinter import messagebox, simpledialog
@@ -516,7 +767,6 @@ class WeComRpaApp:
                 messagebox.showerror("确认失败", "未输入 SEND，真实发送已取消。")
                 return
 
-        self._clear_log()
         self.stop_controller = StopController(self.current_inspection.config.stop_hotkey)
         self._set_running(True)
         self.worker = threading.Thread(target=self._run_worker, args=(options, self.current_inspection, self.stop_controller), daemon=True)
@@ -526,6 +776,14 @@ class WeComRpaApp:
         self._install_logging(options.log_file)
         result: FlowResult | None = None
         try:
+            log.info(
+                "启动运行：dry_run=%s forward_button_ratio=%s source_checkbox_x=%.3f source_checkbox_y=%s targets=%s",
+                inspection.config.dry_run,
+                inspection.config.source_selection.forward_button_ratio,
+                inspection.config.source_selection.checkbox_x_ratio,
+                [round(y, 3) for y in inspection.config.source_selection.checkbox_y_ratios],
+                len(inspection.limited_groups),
+            )
             with StateStore(options.db_path) as store:
                 result = ForwardFlow(
                     inspection.config,

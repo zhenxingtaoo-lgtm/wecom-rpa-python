@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -86,6 +87,21 @@ class ForwardFlow:
             if self.stop.should_stop():
                 return
             time.sleep(min(0.1, deadline - time.monotonic()))
+
+    @contextmanager
+    def _step(self, name: str, **details: Any):
+        detail_text = " ".join(f"{key}={value}" for key, value in details.items())
+        started = time.monotonic()
+        log.info("开始%s%s", name, f"：{detail_text}" if detail_text else "")
+        try:
+            yield
+        except Exception:
+            elapsed = time.monotonic() - started
+            log.exception("%s失败：elapsed=%.2fs%s", name, elapsed, f" {detail_text}" if detail_text else "")
+            raise
+        else:
+            elapsed = time.monotonic() - started
+            log.info("%s完成：elapsed=%.2fs%s", name, elapsed, f" {detail_text}" if detail_text else "")
 
     def _confirm(self, prompt: str) -> None:
         if self.yes:
@@ -262,7 +278,8 @@ class ForwardFlow:
 
     def _run_real_bottom_picker_batch(self, batch_no: int, targets: list[TargetGroup]) -> None:
         """实机方案：使用已校准的相对坐标完成一次底部会话批量发送。"""
-        rect = self.window.locate()
+        with self._step("定位企业微信窗口", batch=batch_no):
+            rect = self.window.locate()
         if rect is None:
             raise RuntimeError("真实发送需要先找到企业微信窗口")
 
@@ -271,24 +288,29 @@ class ForwardFlow:
         log.warning("真实发送批次 %s：即将发送给 %s 个会话", batch_no, selected_count)
 
         if batch_no > 1:
-            self._reselect_source_messages(rect)
-        self._assert_exact_source_selection(rect, f"batch_{batch_no}_source_before_forward")
+            with self._step("重新勾选源消息", batch=batch_no):
+                self._reselect_source_messages(rect)
+        with self._step("复查源消息勾选", batch=batch_no):
+            self._assert_exact_source_selection(rect, f"batch_{batch_no}_source_before_forward")
 
-        self._open_recipient_picker_from_source(rect, batch_no)
+        with self._step("打开收件人选择弹窗", batch=batch_no):
+            self._open_recipient_picker_from_source(rect, batch_no)
 
         picker_open = True
         try:
             # 接收方选择弹窗左侧列表滚到底部。
-            for _ in range(self.config.recipient_selection.scroll_to_bottom_repeats):
-                self.window.mouse_wheel_relative(rect, 0.493, 0.646, -1200)
-                self._sleep(0.15)
+            with self._step("收件人列表滚动到底部", batch=batch_no, repeats=self.config.recipient_selection.scroll_to_bottom_repeats):
+                for _ in range(self.config.recipient_selection.scroll_to_bottom_repeats):
+                    self.window.mouse_wheel_relative(rect, 0.360, 0.620, -1200)
+                    self._sleep(0.15)
 
-            target_checkbox_x = self._recipient_checkbox_x_ratio(rect)
-            target_checkbox_y = self._recipient_checkbox_rows_bottom_to_top(selected_count, rect)
-            for index, y_ratio in enumerate(target_checkbox_y):
-                if self.stop.should_stop():
-                    raise RuntimeError("急停触发")
-                self._click_recipient_checkbox_until_selected(rect, target_checkbox_x, y_ratio, index + 1)
+            target_checkbox_points = self._recipient_checkbox_points_bottom_to_top(selected_count, rect, batch_no)
+            target_checkbox_y = [y_ratio for _x_ratio, y_ratio in target_checkbox_points]
+            with self._step("勾选收件人", batch=batch_no, count=selected_count):
+                for index, (x_ratio, y_ratio) in enumerate(target_checkbox_points):
+                    if self.stop.should_stop():
+                        raise RuntimeError("急停触发")
+                    self._click_recipient_checkbox_until_selected(rect, x_ratio, y_ratio, index + 1)
 
             self.screen.save_checkpoint(f"batch_{batch_no}_recipients_selected", region=Region(rect.left, rect.top, rect.width, rect.height))
 
@@ -334,18 +356,20 @@ class ForwardFlow:
                 self.store.set_status(target.group_name, TargetStatus.SELECTED, batch_no=batch_no)
 
             # 弹窗右下角发送按钮。
-            if not self._click_final_send_button(rect):
-                raise RuntimeError("无法点击发送按钮")
+            with self._step("点击最终发送按钮", batch=batch_no, count=len(effective_targets)):
+                if not self._click_final_send_button(rect):
+                    raise RuntimeError("无法点击发送按钮")
             self._sleep(2.0)
-            evidence = self.screen.save_checkpoint(f"batch_{batch_no}_post_send", region=Region(rect.left, rect.top, rect.width, rect.height))
-            is_capture_evidence = getattr(self.screen, "is_capture_evidence", None)
-            evidence_ok = bool(is_capture_evidence(evidence)) if callable(is_capture_evidence) else evidence.suffix.lower() == ".png"
-            if not evidence_ok:
-                self._mark_targets_uncertain(effective_targets, batch_no, "发送后截图证据不可用")
-                raise RuntimeError("发送后截图证据不可用，已标记 uncertain，需人工确认后再续跑")
-            if self._has_ocr_text(evidence, ("发送给", "分别发送给")):
-                self._mark_targets_uncertain(effective_targets, batch_no, "发送后仍检测到收件人弹窗")
-                raise RuntimeError("发送后仍检测到收件人弹窗，已标记 uncertain，需人工确认后再续跑")
+            with self._step("发送后截图复查", batch=batch_no):
+                evidence = self.screen.save_checkpoint(f"batch_{batch_no}_post_send", region=Region(rect.left, rect.top, rect.width, rect.height))
+                is_capture_evidence = getattr(self.screen, "is_capture_evidence", None)
+                evidence_ok = bool(is_capture_evidence(evidence)) if callable(is_capture_evidence) else evidence.suffix.lower() == ".png"
+                if not evidence_ok:
+                    self._mark_targets_uncertain(effective_targets, batch_no, "发送后截图证据不可用")
+                    raise RuntimeError("发送后截图证据不可用，已标记 uncertain，需人工确认后再续跑")
+                if self._has_ocr_text(evidence, ("发送给", "分别发送给")):
+                    self._mark_targets_uncertain(effective_targets, batch_no, "发送后仍检测到收件人弹窗")
+                    raise RuntimeError("发送后仍检测到收件人弹窗，已标记 uncertain，需人工确认后再续跑")
             picker_open = False
             for target in effective_targets:
                 self.store.set_status(target.group_name, TargetStatus.SENT, batch_no=batch_no)
@@ -359,27 +383,50 @@ class ForwardFlow:
             self.store.set_status(target.group_name, TargetStatus.UNCERTAIN, batch_no=batch_no, error=error)
 
     def _open_recipient_picker_from_source(self, rect: WindowRect, batch_no: int) -> None:
-        # 多选工具栏里的"转发"按钮点击后可能弹出子菜单（逐条转发/合并转发）。
-        # 用键盘导航选中"逐条转发"比坐标点选更可靠。
-        forward_x, forward_y = self.config.source_selection.forward_button_ratio
+        started = time.monotonic()
+        configured_x, configured_y = self.config.source_selection.forward_button_ratio
+        forward_x = min(0.98, max(0.02, float(configured_x)))
+        forward_y = min(0.98, max(0.02, float(configured_y)))
+        click_x, click_y = rect.relative_point(forward_x, forward_y)
+        log.info(
+            "开始点击检查阶段识别到的逐条转发按钮：batch=%s ratio=(%.3f, %.3f) abs=(%s, %s) rect=%s",
+            batch_no,
+            forward_x,
+            forward_y,
+            click_x,
+            click_y,
+            rect,
+        )
         if not self.window.click_relative(rect, forward_x, forward_y):
-            raise RuntimeError("无法点击转发按钮")
-        self._sleep(0.4)
-        # 下拉菜单中"逐条转发"通常是第一项，按 Enter 即可选中。
-        self.window.send_keys("{ENTER}")
+            elapsed = time.monotonic() - started
+            log.error("点击逐条转发按钮失败：batch=%s ratio=(%.3f, %.3f) elapsed=%.2fs", batch_no, forward_x, forward_y, elapsed)
+            raise RuntimeError("无法点击检查阶段识别到的逐条转发按钮")
+        elapsed = time.monotonic() - started
+        log.info("点击逐条转发按钮完成：batch=%s elapsed=%.2fs", batch_no, elapsed)
+
+        started = time.monotonic()
+        log.info("开始等待发送给弹窗出现：batch=%s", batch_no)
         self._sleep(1.0)
-        picker_shot = self.screen.save_checkpoint(f"batch_{batch_no}_recipient_picker_opened", region=Region(rect.left, rect.top, rect.width, rect.height))
-        if not self._has_ocr_text(picker_shot, ("发送给", "分别发送给")):
-            raise RuntimeError("点击逐条转发后未识别到发送给弹窗，已停止以避免误点会话列表")
+        picker_shot = self.screen.save_checkpoint(
+            f"batch_{batch_no}_recipient_picker_opened",
+            region=Region(rect.left, rect.top, rect.width, rect.height),
+        )
+        if self._has_ocr_text(picker_shot, ("发送给", "分别发送给")):
+            elapsed = time.monotonic() - started
+            log.info("发送给弹窗识别完成：batch=%s screenshot=%s elapsed=%.2fs", batch_no, picker_shot, elapsed)
+            return
+        elapsed = time.monotonic() - started
+        log.error("发送给弹窗识别失败：batch=%s screenshot=%s elapsed=%.2fs", batch_no, picker_shot, elapsed)
+        raise RuntimeError(f"点击逐条转发后未识别到发送给弹窗，已停止以避免误点会话列表。screenshot={picker_shot}")
 
     def _recipient_checkbox_x_ratio(self, rect: WindowRect) -> float:
         if rect.width >= 1600:
-            return 0.400
+            return 0.302
         return 0.260
 
     def _recipient_send_button_ratios(self, rect: WindowRect) -> tuple[float, float]:
         if rect.width >= 1600:
-            return (0.695, 0.959)
+            return (0.563, 0.782)
         return (0.574, 0.801)
 
     def _click_final_send_button(self, rect: WindowRect) -> bool:
@@ -394,7 +441,7 @@ class ForwardFlow:
         if selected_count <= 0:
             return []
         if rect is not None and rect.width >= 1600:
-            checkbox_y_top_to_bottom = [0.424, 0.493, 0.562, 0.633, 0.704, 0.774, 0.842, 0.911, 0.980]
+            checkbox_y_top_to_bottom = [0.368, 0.426, 0.485, 0.543, 0.602, 0.660, 0.718, 0.777]
         else:
             checkbox_y_top_to_bottom = [0.319, 0.382, 0.445, 0.507, 0.569, 0.632, 0.694, 0.757, 0.819]
         if selected_count < self.config.batch_size:
@@ -402,6 +449,64 @@ class ForwardFlow:
         else:
             rows = checkbox_y_top_to_bottom[:selected_count]
         return list(reversed(rows))
+
+    def _recipient_checkbox_points_bottom_to_top(
+        self, selected_count: int, rect: WindowRect, batch_no: int
+    ) -> list[tuple[float, float]]:
+        if selected_count <= 0:
+            return []
+        region = self._left_candidate_region(rect)
+        image_path = self.screen.save_checkpoint(
+            f"batch_{batch_no}_recipient_checkbox_candidates",
+            region=region,
+        )
+        find_outlines = getattr(self.screen, "find_checkbox_outline_ratios", None)
+        raw_points = list(find_outlines(image_path)) if callable(find_outlines) else []
+        candidates: list[tuple[float, float]] = []
+        min_x, max_x = self._recipient_checkbox_x_bounds(rect)
+        for local_x, local_y in raw_points:
+            x_ratio = (region.left + round(region.width * local_x) - rect.left) / rect.width
+            y_ratio = (region.top + round(region.height * local_y) - rect.top) / rect.height
+            if min_x <= x_ratio <= max_x:
+                candidates.append((x_ratio, y_ratio))
+
+        candidates = self._dedupe_recipient_checkbox_points(candidates)
+        log.info(
+            "收件人复选框候选识别：batch=%s expected=%s region=%s raw=%s filtered=%s",
+            batch_no,
+            selected_count,
+            region,
+            [(round(x, 3), round(y, 3)) for x, y in raw_points],
+            [(round(x, 3), round(y, 3)) for x, y in candidates],
+        )
+        if len(candidates) < selected_count:
+            fallback_x = self._recipient_checkbox_x_ratio(rect)
+            fallback_y = self._recipient_checkbox_rows_bottom_to_top(selected_count, rect)
+            log.warning(
+                "收件人复选框候选不足，使用兜底坐标：expected=%s actual=%s fallback=%s screenshot=%s",
+                selected_count,
+                len(candidates),
+                [(round(fallback_x, 3), round(y, 3)) for y in fallback_y],
+                image_path,
+            )
+            return [(fallback_x, y_ratio) for y_ratio in fallback_y]
+
+        selected = sorted(candidates, key=lambda point: point[1], reverse=True)[:selected_count]
+        log.info("将从底部往上勾选收件人坐标：%s", [(round(x, 3), round(y, 3)) for x, y in selected])
+        return selected
+
+    def _recipient_checkbox_x_bounds(self, rect: WindowRect) -> tuple[float, float]:
+        if rect.width >= 1600:
+            return (0.285, 0.330)
+        return (0.215, 0.310)
+
+    def _dedupe_recipient_checkbox_points(self, points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        deduped: list[tuple[float, float]] = []
+        for point in sorted(points, key=lambda item: item[1]):
+            if any(abs(point[1] - existing[1]) <= 0.012 for existing in deduped):
+                continue
+            deduped.append(point)
+        return deduped
 
     def _build_sentinel_trim_plan(self, selected_bottom_to_top: list[SelectedRecipient]) -> SentinelTrimPlan:
         sentinel_names = {self._recipient_match_key(name) for name in self.config.recipient_selection.sentinel.names}
@@ -459,16 +564,16 @@ class ForwardFlow:
     def _left_candidate_region(self, rect: WindowRect) -> Region:
         if rect.width >= 1600:
             return Region(
-                left=rect.left + round(rect.width * 0.340),
-                top=rect.top + round(rect.height * 0.245),
-                width=round(rect.width * 0.290),
-                height=round(rect.height * 0.755),
+                left=rect.left + round(rect.width * 0.285),
+                top=rect.top + round(rect.height * 0.345),
+                width=round(rect.width * 0.345),
+                height=round(rect.height * 0.500),
             )
         return Region(
-            left=rect.left + round(rect.width * 0.220),
-            top=rect.top + round(rect.height * 0.200),
-            width=round(rect.width * 0.420),
-            height=round(rect.height * 0.790),
+            left=rect.left + round(rect.width * 0.200),
+            top=rect.top + round(rect.height * 0.260),
+            width=round(rect.width * 0.450),
+            height=round(rect.height * 0.610),
         )
 
     def _read_left_selected_recipients(self, rect: WindowRect, selected_y_ratios: list[float]) -> list[SelectedRecipient]:
@@ -787,7 +892,7 @@ class ForwardFlow:
         return [
             (x_ratio, y_ratio)
             for x_ratio, y_ratio in self.screen.find_selected_checkbox_ratios(image_path)
-            if 0.18 <= x_ratio <= 0.50 and 0.20 <= y_ratio <= 0.90
+            if 0.18 <= x_ratio <= 0.50 and 0.12 <= y_ratio <= 0.92
         ]
 
     def _source_selected_checkbox_ratios_in_window(self, image_path, rect: WindowRect | None) -> list[tuple[float, float]]:
@@ -800,7 +905,14 @@ class ForwardFlow:
         return self._convert_fullscreen_checkbox_ratios_to_window(image_path, rect, image_size)
 
     def _source_selected_checkbox_ratios_from_fullscreen(self, rect: WindowRect, checkpoint_name: str) -> list[tuple[float, float]]:
-        image_path = self.screen.save_checkpoint(checkpoint_name, region=None)
+        save_fullscreen = getattr(self.screen, "save_fullscreen_checkpoint", None)
+        save_checkpoint = getattr(self.screen, "save_checkpoint", None)
+        if callable(save_fullscreen):
+            image_path = save_fullscreen(checkpoint_name)
+        elif callable(save_checkpoint):
+            image_path = save_checkpoint(checkpoint_name, region=None)
+        else:
+            return []
         size_getter = getattr(self.screen, "image_size", None)
         image_size = size_getter(image_path) if callable(size_getter) else None
         if not image_size:
@@ -816,25 +928,42 @@ class ForwardFlow:
         image_width, image_height = image_size
         if image_width <= 0 or image_height <= 0 or rect.width <= 0 or rect.height <= 0:
             return []
-        scale = 1.0
-        if image_width > rect.width * 1.25:
-            scale = image_width / rect.width
 
-        converted: list[tuple[float, float]] = []
-        for x_ratio, y_ratio in self.screen.find_selected_checkbox_ratios(image_path):
-            abs_x = x_ratio * image_width
-            abs_y = y_ratio * image_height
+        raw_points = list(self.screen.find_selected_checkbox_ratios(image_path))
+
+        def convert_with_scale(scale: float) -> list[tuple[float, float]]:
+            converted: list[tuple[float, float]] = []
             scaled_left = rect.left * scale
             scaled_top = rect.top * scale
             scaled_width = rect.width * scale
             scaled_height = rect.height * scale
-            if not (scaled_left <= abs_x <= scaled_left + scaled_width and scaled_top <= abs_y <= scaled_top + scaled_height):
-                continue
-            local_x = (abs_x - scaled_left) / scaled_width
-            local_y = (abs_y - scaled_top) / scaled_height
-            if 0.18 <= local_x <= 0.50 and 0.20 <= local_y <= 0.90:
-                converted.append((local_x, local_y))
-        return converted
+            for x_ratio, y_ratio in raw_points:
+                abs_x = x_ratio * image_width
+                abs_y = y_ratio * image_height
+                if not (scaled_left <= abs_x <= scaled_left + scaled_width and scaled_top <= abs_y <= scaled_top + scaled_height):
+                    continue
+                local_x = (abs_x - scaled_left) / scaled_width
+                local_y = (abs_y - scaled_top) / scaled_height
+                if 0.18 <= local_x <= 0.50 and 0.12 <= local_y <= 0.92:
+                    converted.append((local_x, local_y))
+            return converted
+
+        primary = convert_with_scale(1.0)
+        if primary:
+            return primary
+
+        scales: list[float] = []
+        if image_width > rect.width * 1.25:
+            scales.append(image_width / rect.width)
+        if image_height > rect.height * 1.25:
+            height_scale = image_height / rect.height
+            if not any(abs(height_scale - existing) <= 0.02 for existing in scales):
+                scales.append(height_scale)
+        for scale in scales:
+            converted = convert_with_scale(scale)
+            if converted:
+                return converted
+        return []
 
     def _enter_multiselect_from_source(self, rect: WindowRect) -> float:
         for checkbox_y, right_click_x, right_click_y in self._source_context_menu_candidates():

@@ -88,18 +88,21 @@ class WeComWindow:
         return rect
 
     def _prepare_window(self, win: Any) -> None:
+        maximized = False
         try:
-            if getattr(win, "isMaximized", False):
-                win.restore()
+            if hasattr(win, "maximize"):
+                win.maximize()
+                time.sleep(0.3)
+                maximized = True
+        except Exception as exc:
+            log.debug("最大化企业微信窗口失败：%s", exc)
+        if not maximized:
+            try:
+                win.resizeTo(1600, 900)
+                win.moveTo(0, 0)
                 time.sleep(0.2)
-        except Exception as exc:
-            log.debug("还原企业微信窗口失败：%s", exc)
-        try:
-            win.resizeTo(1201, 801)
-            win.moveTo(98, 78)
-            time.sleep(0.2)
-        except Exception as exc:
-            log.debug("调整企业微信窗口尺寸失败：%s", exc)
+            except Exception as exc:
+                log.debug("调整企业微信窗口尺寸失败：%s", exc)
         try:
             win.activate()
         except Exception as exc:
@@ -138,6 +141,8 @@ using System;
 using System.Runtime.InteropServices;
 public class Win32Rect {
   public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  [DllImport("shcore.dll")] public static extern int SetProcessDpiAwareness(int value);
   [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder text, int count);
@@ -151,6 +156,7 @@ public class Win32Rect {
 }
 "@
 [Console]::OutputEncoding=[System.Text.Encoding]::UTF8
+try { [void][Win32Rect]::SetProcessDpiAwareness(2) } catch { try { [void][Win32Rect]::SetProcessDPIAware() } catch {} }
 Add-Type -AssemblyName System.Windows.Forms
 $wxProcesses = @(Get-Process WXWork -ErrorAction SilentlyContinue)
 if (-not $wxProcesses) { exit 2 }
@@ -200,13 +206,10 @@ if (-not $p) {
 if (-not $p) { exit 2 }
 $h = [IntPtr]$p.Hwnd
 $workArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-$targetWidth = [Math]::Min(1600, $workArea.Width)
-$targetHeight = [Math]::Min(900, $workArea.Height)
-[void][Win32Rect]::ShowWindow($h, 9)
-[void][Win32Rect]::SetWindowPos($h, [IntPtr]::Zero, $workArea.Left, $workArea.Top, $targetWidth, $targetHeight, 0x0040)
+[void][Win32Rect]::ShowWindow($h, 3)
 [void][Win32Rect]::BringWindowToTop($h)
 [void][Win32Rect]::SetForegroundWindow($h)
-Start-Sleep -Milliseconds 300
+Start-Sleep -Milliseconds 500
 $r = New-Object Win32Rect+RECT
 [void][Win32Rect]::GetWindowRect($h, [ref]$r)
 [PSCustomObject]@{ Hwnd=$h.ToInt64(); Left=$r.Left; Top=$r.Top; Width=$r.Right-$r.Left; Height=$r.Bottom-$r.Top; Title=$p.Title; IsMainHandle=$p.IsMainHandle; WorkAreaWidth=$workArea.Width; WorkAreaHeight=$workArea.Height } | ConvertTo-Json -Compress
@@ -256,15 +259,32 @@ $r = New-Object Win32Rect+RECT
     def click_relative(self, rect: WindowRect, x_ratio: float, y_ratio: float) -> bool:
         self._activate_last_window()
         point = rect.relative_point(x_ratio, y_ratio)
-        return self._click_point_via_powershell(*point)
+        log.info(
+            "点击窗口相对坐标：ratio=(%.3f, %.3f) abs=(%s, %s) rect=%s",
+            x_ratio,
+            y_ratio,
+            point[0],
+            point[1],
+            rect,
+        )
+        return self._click_point_via_pyautogui(*point) or self._click_point_via_powershell(*point)
 
     def click_screen(self, x: int, y: int) -> bool:
         self._activate_last_window()
+        log.info("点击屏幕坐标：abs=(%s, %s)", x, y)
         return self._click_point_via_pyautogui(x, y) or self._click_point_via_powershell(x, y)
 
     def right_click_relative(self, rect: WindowRect, x_ratio: float, y_ratio: float) -> bool:
         self._activate_last_window()
         point = rect.relative_point(x_ratio, y_ratio)
+        log.info(
+            "右键点击窗口相对坐标：ratio=(%.3f, %.3f) abs=(%s, %s) rect=%s",
+            x_ratio,
+            y_ratio,
+            point[0],
+            point[1],
+            rect,
+        )
         return self._right_click_point_via_powershell(*point)
 
     def send_keys(self, keys: str) -> bool:
@@ -294,10 +314,10 @@ public class ActivateWeComWindow {
 }
 "@
 $h = [IntPtr]$Hwnd
-[void][ActivateWeComWindow]::ShowWindow($h, 9)
+[void][ActivateWeComWindow]::ShowWindow($h, 3)
 [void][ActivateWeComWindow]::BringWindowToTop($h)
 [void][ActivateWeComWindow]::SetForegroundWindow($h)
-Start-Sleep -Milliseconds 80
+Start-Sleep -Milliseconds 120
 """.strip()
         return self._run_temp_powershell(script, ["-Hwnd", str(self._last_hwnd)])
 
@@ -322,23 +342,32 @@ Add-Type @"
 using System;
 using System.Runtime.InteropServices;
 public class MouseClickSafe {
+  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  [DllImport("shcore.dll")] public static extern int SetProcessDpiAwareness(int value);
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
   [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
 }
 "@
+try { [void][MouseClickSafe]::SetProcessDpiAwareness(2) } catch { try { [void][MouseClickSafe]::SetProcessDPIAware() } catch {} }
 [MouseClickSafe]::SetCursorPos($X, $Y) | Out-Null
 Start-Sleep -Milliseconds 80
 [MouseClickSafe]::mouse_event(0x0002,0,0,0,[UIntPtr]::Zero)
 Start-Sleep -Milliseconds 50
 [MouseClickSafe]::mouse_event(0x0004,0,0,0,[UIntPtr]::Zero)
 """.strip()
-        return self._run_temp_powershell(script, ["-X", str(x), "-Y", str(y)])
+        ok = self._run_temp_powershell(script, ["-X", str(x), "-Y", str(y)])
+        log.info("PowerShell 点击完成：abs=(%s, %s) ok=%s", x, y, ok)
+        return ok
 
     def _click_point_via_pyautogui(self, x: int, y: int) -> bool:
         try:
             import pyautogui
 
+            log.info("pyautogui 点击开始：abs=(%s, %s)", x, y)
+            pyautogui.moveTo(x, y, duration=0.05)
             pyautogui.click(x, y)
+            current = pyautogui.position()
+            log.info("pyautogui 点击完成：requested=(%s, %s) cursor=(%s, %s)", x, y, current.x, current.y)
             return True
         except Exception as exc:
             log.debug("pyautogui 点击失败：%s", exc)

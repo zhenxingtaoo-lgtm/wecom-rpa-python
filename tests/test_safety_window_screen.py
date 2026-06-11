@@ -1,6 +1,7 @@
 from pathlib import Path
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from wecom_rpa.safety import StopController, assert_batch_selection_count, assert_send_limit
@@ -42,13 +43,12 @@ class SafetyWindowScreenTest(unittest.TestCase):
         self.assertIn("IsMainHandle", script)
         self.assertNotIn("[IntPtr](-1)", script)
 
-    def test_powershell_locator_clamps_window_to_working_area(self):
+    def test_powershell_locator_maximizes_window(self):
         script = WeComWindow("企业微信")._powershell_locator_script()
 
         self.assertIn("WorkingArea", script)
-        self.assertIn("[Math]::Min(1600", script)
-        self.assertIn("[Math]::Min(900", script)
-        self.assertNotIn("0, 0, 1600, 900", script)
+        self.assertIn("ShowWindow($h, 3)", script)
+        self.assertNotIn("SetWindowPos($h", script)
 
     def test_scroll_chat_to_bottom_validates_repeats(self):
         window = WeComWindow("企业微信")
@@ -102,6 +102,24 @@ class SafetyWindowScreenTest(unittest.TestCase):
             self.assertAlmostEqual(points[0][0], 917.5 / 2880, places=3)
             self.assertAlmostEqual(points[0][1], 1177.5 / 1800, places=3)
             self.assertAlmostEqual(points[1][1], 1527.5 / 1800, places=3)
+
+    def test_checkbox_outline_detection_handles_picker_rows(self):
+        with tempfile.TemporaryDirectory() as d:
+            from PIL import Image, ImageDraw
+
+            image_path = Path(d) / "picker_rows.png"
+            image = Image.new("RGB", (996, 856), (255, 255, 255))
+            draw = ImageDraw.Draw(image)
+            for top in (27, 127, 227):
+                draw.rectangle((30, top, 61, top + 31), outline=(170, 170, 170), width=2)
+            image.save(image_path)
+
+            points = ScreenInspector(Path(d) / "screenshots").find_checkbox_outline_ratios(image_path)
+
+            self.assertEqual(len(points), 3)
+            self.assertAlmostEqual(points[0][0], 45.5 / 996, places=3)
+            self.assertAlmostEqual(points[0][1], 42.5 / 856, places=3)
+            self.assertAlmostEqual(points[2][1], 242.5 / 856, places=3)
 
     def test_windows_ocr_json_maps_to_lines(self):
         with tempfile.TemporaryDirectory() as d:
@@ -172,7 +190,9 @@ class SafetyWindowScreenTest(unittest.TestCase):
 
     def test_configured_paddle_model_root_requires_offline_files(self):
         with tempfile.TemporaryDirectory() as d:
-            inspector = ScreenInspector("screenshots", paddle_model_root=Path(d) / "models" / "paddleocr")
+            model_root = Path(d) / "models" / "paddleocr"
+            model_root.mkdir(parents=True)
+            inspector = ScreenInspector("screenshots", paddle_model_root=model_root)
 
             with self.assertRaisesRegex(FileNotFoundError, "离线模型不完整"):
                 inspector.paddleocr_model_kwargs()
