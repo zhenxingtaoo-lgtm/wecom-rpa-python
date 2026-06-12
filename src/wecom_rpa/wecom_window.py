@@ -294,7 +294,19 @@ $r = New-Object Win32Rect+RECT
     def mouse_wheel_relative(self, rect: WindowRect, x_ratio: float, y_ratio: float, delta: int) -> bool:
         self._activate_last_window()
         point = rect.relative_point(x_ratio, y_ratio)
-        return self._mouse_wheel_via_powershell(point[0], point[1], delta)
+        log.info(
+            "滚动窗口相对坐标：ratio=(%.3f, %.3f) abs=(%s, %s) delta=%s rect=%s",
+            x_ratio,
+            y_ratio,
+            point[0],
+            point[1],
+            delta,
+            rect,
+        )
+        return self._mouse_wheel_via_pyautogui(point[0], point[1], delta) or self._mouse_wheel_via_powershell(point[0], point[1], delta)
+
+    def activate(self) -> bool:
+        return self._activate_last_window()
 
     def _activate_last_window(self) -> bool:
         if self._last_hwnd is None:
@@ -371,6 +383,23 @@ Start-Sleep -Milliseconds 50
             return True
         except Exception as exc:
             log.debug("pyautogui 点击失败：%s", exc)
+            return False
+
+    def _mouse_wheel_via_pyautogui(self, x: int, y: int, delta: int) -> bool:
+        try:
+            import pyautogui
+
+            wheel_clicks = int(delta / 120)
+            if wheel_clicks == 0:
+                wheel_clicks = 1 if delta > 0 else -1
+            log.info("pyautogui 滚轮开始：abs=(%s, %s) clicks=%s delta=%s", x, y, wheel_clicks, delta)
+            pyautogui.moveTo(x, y, duration=0.05)
+            pyautogui.scroll(wheel_clicks, x=x, y=y)
+            current = pyautogui.position()
+            log.info("pyautogui 滚轮完成：requested=(%s, %s) cursor=(%s, %s)", x, y, current.x, current.y)
+            return True
+        except Exception as exc:
+            log.debug("pyautogui 滚轮失败：%s", exc)
             return False
 
     def _right_click_point_via_powershell(self, x: int, y: int) -> bool:

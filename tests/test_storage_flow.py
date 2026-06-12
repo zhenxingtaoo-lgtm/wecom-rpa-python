@@ -224,6 +224,7 @@ class StorageFlowTest(unittest.TestCase):
                 flow.window = fake
                 flow._assert_exact_source_selection = lambda *_args, **_kwargs: None
                 flow._open_recipient_picker_from_source = lambda *_args, **_kwargs: None
+                flow._assert_recipient_picker_still_open = lambda *_args, **_kwargs: None
                 flow._recipient_checkbox_points_bottom_to_top = lambda *_args, **_kwargs: [(0.260, 0.819), (0.260, 0.757)]
                 flow._click_recipient_checkbox_until_selected = lambda rect, x, y, _index: flow.window.click_relative(rect, x, y)
                 flow.screen.is_capture_evidence = lambda _path: True  # type: ignore[method-assign]
@@ -371,6 +372,8 @@ class StorageFlowTest(unittest.TestCase):
                 flow.screen = FakeScreen()
                 flow._assert_exact_source_selection = lambda *_args, **_kwargs: None
                 flow._open_recipient_picker_from_source = lambda *_args, **_kwargs: None
+                flow._assert_recipient_picker_still_open = lambda *_args, **_kwargs: None
+                flow._recipient_checkbox_points_bottom_to_top = lambda count, rect, _batch: [(0.260, y) for y in flow._recipient_checkbox_rows_bottom_to_top(count, rect)]
                 flow._click_recipient_checkbox_until_selected = lambda rect, x, y, _index: flow.window.click_relative(rect, x, y)
                 flow._read_left_selected_recipients = lambda _rect, _rows: [
                     SelectedRecipient("群A", 0.819),
@@ -438,6 +441,8 @@ class StorageFlowTest(unittest.TestCase):
                 flow.screen = FakeScreen()
                 flow._assert_exact_source_selection = lambda *_args, **_kwargs: None
                 flow._open_recipient_picker_from_source = lambda *_args, **_kwargs: None
+                flow._assert_recipient_picker_still_open = lambda *_args, **_kwargs: None
+                flow._recipient_checkbox_points_bottom_to_top = lambda count, rect, _batch: [(0.260, y) for y in flow._recipient_checkbox_rows_bottom_to_top(count, rect)]
                 flow._click_recipient_checkbox_until_selected = lambda rect, x, y, _index: flow.window.click_relative(rect, x, y)
                 flow._read_left_selected_recipients = lambda _rect, _rows: [
                     SelectedRecipient("群A", 0.819),
@@ -509,6 +514,8 @@ class StorageFlowTest(unittest.TestCase):
                 flow.screen = FakeScreen()
                 flow._assert_exact_source_selection = lambda *_args, **_kwargs: None
                 flow._open_recipient_picker_from_source = lambda *_args, **_kwargs: None
+                flow._assert_recipient_picker_still_open = lambda *_args, **_kwargs: None
+                flow._recipient_checkbox_points_bottom_to_top = lambda count, rect, _batch: [(0.260, y) for y in flow._recipient_checkbox_rows_bottom_to_top(count, rect)]
                 flow._click_recipient_checkbox_until_selected = lambda rect, x, y, _index: flow.window.click_relative(rect, x, y)
                 flow._read_left_selected_recipients = lambda _rect, _rows: [SelectedRecipient("员工1", 0.819), SelectedRecipient("群A", 0.757)]
 
@@ -564,6 +571,8 @@ class StorageFlowTest(unittest.TestCase):
                 flow.screen = FakeScreen()
                 flow._assert_exact_source_selection = lambda *_args, **_kwargs: None
                 flow._open_recipient_picker_from_source = lambda *_args, **_kwargs: None
+                flow._assert_recipient_picker_still_open = lambda *_args, **_kwargs: None
+                flow._recipient_checkbox_points_bottom_to_top = lambda count, rect, _batch: [(0.260, y) for y in flow._recipient_checkbox_rows_bottom_to_top(count, rect)]
                 flow._click_recipient_checkbox_until_selected = lambda rect, x, y, _index: flow.window.click_relative(rect, x, y)
                 flow._read_left_selected_recipients = lambda _rect, _rows: []
 
@@ -618,6 +627,8 @@ class StorageFlowTest(unittest.TestCase):
                 flow.screen = FakeScreen()
                 flow._assert_exact_source_selection = lambda *_args, **_kwargs: None
                 flow._open_recipient_picker_from_source = lambda *_args, **_kwargs: None
+                flow._assert_recipient_picker_still_open = lambda *_args, **_kwargs: None
+                flow._recipient_checkbox_points_bottom_to_top = lambda count, rect, _batch: [(0.260, y) for y in flow._recipient_checkbox_rows_bottom_to_top(count, rect)]
                 flow._click_recipient_checkbox_until_selected = lambda rect, x, y, _index: flow.window.click_relative(rect, x, y)
                 flow._read_left_selected_recipients = lambda _rect, _rows: [
                     SelectedRecipient("群A", 0.819),
@@ -677,7 +688,7 @@ class StorageFlowTest(unittest.TestCase):
 
                 def find_selected_checkbox_ratios(self, *_args, **_kwargs):
                     return [
-                        (0.049, 0.880),  # real checkbox column
+                        (0.300, 0.780),  # real checkbox column
                         (0.319, 0.863),  # blue "全员" tag; must be ignored
                     ]
 
@@ -688,7 +699,7 @@ class StorageFlowTest(unittest.TestCase):
                 selected_y = flow._left_selected_checkbox_y_ratios(WindowRect(0, 0, 1600, 900), "probe")
 
                 self.assertEqual(len(selected_y), 1)
-                self.assertAlmostEqual(selected_y[0], 0.786, places=2)
+                self.assertAlmostEqual(selected_y[0], 0.780, places=2)
 
     def test_reselect_source_messages_requires_visible_selected_checkboxes(self):
         with tempfile.TemporaryDirectory() as d:
@@ -1043,6 +1054,8 @@ class StorageFlowTest(unittest.TestCase):
                 flow.screen = FakeScreen()
                 flow._assert_exact_source_selection = lambda *_args, **_kwargs: None
                 flow._open_recipient_picker_from_source = lambda *_args, **_kwargs: None
+                flow._assert_recipient_picker_still_open = lambda *_args, **_kwargs: None
+                flow._recipient_checkbox_points_bottom_to_top = lambda count, rect, _batch: [(0.260, y) for y in flow._recipient_checkbox_rows_bottom_to_top(count, rect)]
                 flow._click_recipient_checkbox_until_selected = lambda rect, x, y, _index: flow.window.click_relative(rect, x, y)
 
                 with self.assertRaisesRegex(RuntimeError, "发送后截图"):
