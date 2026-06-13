@@ -1060,13 +1060,42 @@ class ForwardFlow:
         for y_ratio in self.source_checkbox_y_ratios:
             if abs(y_ratio - already_selected_y) < 0.04:
                 continue
-            click_x, click_y = rect.relative_point(self.source_checkbox_x_ratio, y_ratio)
-            if not self.window.click_screen(click_x, click_y):
-                raise RuntimeError("无法重新勾选待转发消息复选框")
-            self._sleep(0.2)
+            self._click_source_checkbox_until_selected(rect, self.source_checkbox_x_ratio, y_ratio)
         image_path = self.screen.save_checkpoint("source_messages_reselected", region=None)
         if not self._verify_source_messages_selected(image_path, rect=rect):
             raise RuntimeError("第二轮源消息多选未成功打开或待转发消息未全部勾选")
+
+    def _click_source_checkbox_until_selected(self, rect: WindowRect, x_ratio: float, y_ratio: float) -> None:
+        # 优先向左偏，因为右偏会点中消息正文/名称，可能弹出名片
+        attempts = [
+            (x_ratio, y_ratio),
+            (x_ratio - 0.006, y_ratio),
+            (x_ratio - 0.012, y_ratio),
+            (x_ratio - 0.018, y_ratio),
+            (x_ratio - 0.003, y_ratio + 0.006),
+            (x_ratio - 0.006, y_ratio + 0.006),
+            (x_ratio - 0.009, y_ratio - 0.006),
+        ]
+        for attempt_x, attempt_y in attempts:
+            if self.stop.should_stop():
+                raise RuntimeError("急停触发，已停止重新选择源消息")
+            click_x, click_y = rect.relative_point(attempt_x, attempt_y)
+            if not self.window.click_screen(click_x, click_y):
+                continue
+            self._sleep(0.25)
+            if self._is_source_row_selected(rect, y_ratio):
+                return
+        raise RuntimeError(f"无法重新勾选源消息复选框：y_ratio={y_ratio:.3f}")
+
+    def _is_source_row_selected(self, rect: WindowRect, y_ratio: float) -> bool:
+        checkpoint = self.screen.save_checkpoint(
+            f"source_row_{y_ratio:.3f}_check",
+            region=None,
+        )
+        for _check_x, check_y in self._source_selected_checkbox_ratios(checkpoint):
+            if abs(check_y - y_ratio) <= 0.035:
+                return True
+        return False
 
     def _assert_exact_source_selection(self, rect: WindowRect, checkpoint_name: str) -> None:
         image_path = self.screen.save_checkpoint(checkpoint_name, region=None)
