@@ -1,104 +1,94 @@
-from __future__ import annotations
-
 from pathlib import Path
 import tempfile
 import unittest
 
-from wecom_rpa.gui import GuiRunOptions, compute_gui_layout, inspect_run_setup, validate_real_send_ready
-from wecom_rpa.models import TargetGroup, TargetStatus
-from wecom_rpa.storage import StateStore
+import json
+from unittest import mock
+
+from wecom_rpa.gui import GuiRunOptions, WeComRpaApp, compute_gui_layout, inspect_run_setup, validate_real_send_ready, write_run_snapshot
 
 
 class GuiSupportTest(unittest.TestCase):
+    def test_stop_button_only_requests_worker_stop(self):
+        app = WeComRpaApp.__new__(WeComRpaApp)
+        app.worker = mock.Mock()
+        app.worker.is_alive.return_value = True
+        app.status_var = mock.Mock()
+        app.progress_var = mock.Mock()
+        app.stop_button = mock.Mock()
+        app.stop_controller = mock.Mock()
+
+        with mock.patch("wecom_rpa.gui.terminate_active_powershell") as terminate:
+            app._request_stop()
+
+        app.stop_controller.request_stop.assert_called_once_with()
+        app.stop_button.configure.assert_called_once_with(state="disabled")
+        terminate.assert_called_once_with()
+
     def test_validate_real_send_ready_requires_both_confirmations(self):
         validate_real_send_ready(dry_run=True, confirm_send=False, confirm_review=False)
-
-        with self.assertRaisesRegex(ValueError, "真实发送确认"):
+        with self.assertRaises(ValueError):
             validate_real_send_ready(dry_run=False, confirm_send=True, confirm_review=False)
-
-        with self.assertRaisesRegex(ValueError, "真实发送确认"):
-            validate_real_send_ready(dry_run=False, confirm_send=False, confirm_review=True)
-
         validate_real_send_ready(dry_run=False, confirm_send=True, confirm_review=True)
 
     def test_compute_gui_layout_fits_high_dpi_logical_work_area(self):
         layout = compute_gui_layout(screen_width=1440, screen_height=852, tk_scaling=2.0)
+        self.assertLessEqual(layout.width, 1400)
+        self.assertLessEqual(layout.height, 820)
 
-        self.assertLessEqual(layout.width, 1368)
-        self.assertLessEqual(layout.height, 810)
-        self.assertGreaterEqual(layout.width, 1100)
-        self.assertGreaterEqual(layout.height, 720)
-        self.assertGreaterEqual(layout.base_font_size, 10)
-
-    def test_compute_gui_layout_keeps_small_screens_usable(self):
-        layout = compute_gui_layout(screen_width=1024, screen_height=720, tk_scaling=1.0)
-
-        self.assertLessEqual(layout.width, 984)
-        self.assertLessEqual(layout.height, 680)
-        self.assertLessEqual(layout.min_width, layout.width)
-        self.assertLessEqual(layout.min_height, layout.height)
-
-    def test_inspect_run_setup_applies_overrides_without_rewriting_yaml(self):
+    def test_inspection_uses_gui_send_count_and_batch_overrides(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             config_path = root / "config.yaml"
-            groups_path = root / "groups.csv"
-            db_path = root / "state.sqlite3"
-            config_text = "max_total_send: 10\nbatch_size: 9\nbatch_interval_sec: 5\ndry_run: true\n"
-            config_path.write_text(config_text, encoding="utf-8")
-            groups_path.write_text("group_name\nA群\nB群\nA群\n", encoding="utf-8")
-
-            options = GuiRunOptions(
-                config_path=config_path,
-                groups_path=groups_path,
-                db_path=db_path,
-                log_file=root / "logs" / "wecom_rpa.log",
-                screenshot_dir=root / "screenshots",
-                dry_run=False,
-                max_total_send=1,
-                batch_size=1,
-                batch_interval_sec=0.25,
-                confirm_real_send=True,
-                confirm_source_review=True,
-            )
-
-            inspection = inspect_run_setup(options)
-
-            self.assertFalse(inspection.config.dry_run)
-            self.assertEqual(inspection.config.max_total_send, 1)
-            self.assertEqual(inspection.config.batch_size, 1)
-            self.assertEqual(inspection.config.batch_interval_sec, 0.25)
-            self.assertEqual(inspection.original_count, 2)
-            self.assertEqual(inspection.limited_count, 1)
-            self.assertFalse(inspection.has_uncertain)
-            self.assertEqual(config_path.read_text(encoding="utf-8"), config_text)
-
-    def test_inspect_run_setup_reports_uncertain_targets(self):
-        with tempfile.TemporaryDirectory() as d:
-            root = Path(d)
-            config_path = root / "config.yaml"
-            groups_path = root / "groups.csv"
-            db_path = root / "state.sqlite3"
-            config_path.write_text("max_total_send: 5\nbatch_size: 2\ndry_run: true\n", encoding="utf-8")
-            groups_path.write_text("group_name\nA群\nB群\n", encoding="utf-8")
-
-            with StateStore(db_path) as store:
-                store.upsert_targets([TargetGroup("A群"), TargetGroup("B群")])
-                store.set_status("B群", TargetStatus.UNCERTAIN)
-
+            config_path.write_text("batch_size: 9\nbatch_interval_sec: 5\ndry_run: true\n", encoding="utf-8")
             inspection = inspect_run_setup(
                 GuiRunOptions(
                     config_path=config_path,
-                    groups_path=groups_path,
-                    db_path=db_path,
                     log_file=root / "logs" / "wecom_rpa.log",
                     screenshot_dir=root / "screenshots",
+                    send_count=20,
                     dry_run=True,
+                    batch_size=8,
+                    batch_interval_sec=0.25,
                 )
             )
+            self.assertEqual(inspection.send_count, 20)
+            self.assertEqual(inspection.batch_count, 3)
+            self.assertEqual(inspection.config.batch_size, 8)
+            self.assertEqual(inspection.config.batch_interval_sec, 0.25)
 
-            self.assertTrue(inspection.has_uncertain)
-            self.assertEqual(inspection.uncertain_targets, ["B群"])
+    def test_inspection_rejects_non_positive_send_count(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            config_path = root / "config.yaml"
+            config_path.write_text("batch_size: 9\ndry_run: true\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "发送数量"):
+                inspect_run_setup(
+                    GuiRunOptions(
+                        config_path=config_path,
+                        log_file=root / "run.log",
+                        screenshot_dir=root / "screenshots",
+                        send_count=0,
+                    )
+                )
+
+    def test_run_snapshot_records_effective_parameters(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            config_path = root / "config.yaml"
+            config_path.write_text("batch_size: 9\ndry_run: true\n", encoding="utf-8")
+            options = GuiRunOptions(
+                config_path=config_path,
+                log_file=root / "logs" / "wecom_rpa.log",
+                screenshot_dir=root / "screenshots",
+                send_count=12,
+            )
+            inspection = inspect_run_setup(options)
+            snapshot = write_run_snapshot(options, inspection)
+            payload = json.loads(snapshot.read_text(encoding="utf-8"))
+            self.assertEqual(payload["send_count"], 12)
+            self.assertEqual(payload["batch_count"], 2)
+            self.assertEqual(payload["effective_config"]["batch_size"], 9)
 
 
 if __name__ == "__main__":

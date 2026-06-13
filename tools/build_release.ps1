@@ -81,8 +81,6 @@ try {
   if (Test-Path "templates") {
     Copy-Item -Recurse -Force templates (Join-Path $ReleaseRoot "templates")
   }
-  New-Item -ItemType Directory -Force (Join-Path $ReleaseRoot "data") | Out-Null
-  Copy-Item -Force data\*.csv (Join-Path $ReleaseRoot "data")
   Copy-Item -Recurse -Force $ModelSource (Join-Path $ReleaseRoot "models\paddleocr")
   Copy-Item -Force packaging\*.bat $ReleaseRoot
   Copy-Item -Force packaging\README_USER.md (Join-Path $ReleaseRoot "README_USER.md")

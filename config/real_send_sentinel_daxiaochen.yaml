@@ -1,8 +1,6 @@
 # 一次性真实发送配置：启用“大小尘”作为哨兵边界。
-max_total_send: 9
 batch_size: 9
 batch_interval_sec: 0
-max_retry_per_group: 2
 
 recipient_selection:
   mode: bottom_of_picker
@@ -36,7 +34,7 @@ ocr:
   engine: paddleocr
   lang: ch
   fallback: windows
-  model_root: models/paddleocr
+  model_root: null
 
 vision:
   template_threshold: 0.86

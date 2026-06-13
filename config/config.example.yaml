@@ -1,8 +1,6 @@
 # 企业微信 RPA 示例配置
 
 # 本次最多实际处理多少个目标群，必须 > 0
-max_total_send: 100
-
 # 企业微信限制：每次最多 9 个会话
 batch_size: 9
 
@@ -10,7 +8,6 @@ batch_size: 9
 batch_interval_sec: 5
 
 # 单个群搜索/选择失败后的重试次数
-max_retry_per_group: 2
 
 # 收件人选择策略
 # bottom_of_picker = 在“选择聊天/发送给”弹窗里滚到底部，连续勾选底部最多 9 个会话。
@@ -73,7 +70,7 @@ ocr:
   engine: paddleocr
   lang: ch
   fallback: windows
-  model_root: models/paddleocr
+  model_root: null
 
 # 模板匹配阈值
 vision:

@@ -28,8 +28,7 @@ try {
 
   & $Exe `
     --config config\config.example.yaml `
-    --groups data\groups.example.csv `
-    --db data\release_dry_run.sqlite3 `
+    --send-count 1 `
     --log-file logs\release_dry_run.log `
     --screenshot-dir screenshots\release_dry_run `
     --yes `

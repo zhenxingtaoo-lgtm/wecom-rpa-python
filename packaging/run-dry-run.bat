@@ -13,8 +13,7 @@ if not exist "config\config.example.yaml" (
 
 app\wecom-rpa.exe ^
   --config config\config.example.yaml ^
-  --groups data\groups.example.csv ^
-  --db data\wecom_rpa.sqlite3 ^
+  --send-count 1 ^
   --log-file logs\wecom_rpa.log ^
   --screenshot-dir screenshots\dry_run ^
   --yes ^

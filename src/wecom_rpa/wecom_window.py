@@ -77,6 +77,9 @@ class WeComWindow:
             return None
 
         win = candidates[0]
+        hwnd = getattr(win, "_hWnd", None)
+        if hwnd:
+            self._last_hwnd = int(hwnd)
         self._prepare_window(win)
         rect = WindowRect(
             left=int(getattr(win, "left", 0) or 0),
@@ -244,11 +247,12 @@ $r = New-Object Win32Rect+RECT
         if rect is not None:
             # 先尝试把焦点落在聊天消息区域中下部，避免 End 键作用到搜索框/输入框。
             focus = rect.relative_point(0.58, 0.72)
-            self._click_point_via_powershell(*focus)
+            self._ensure_foreground()
+            self._click_point_via_pyautogui(*focus) or self._click_point_via_powershell(*focus)
             time.sleep(0.15)
         ok = False
         for _ in range(repeats):
-            ok = self._send_keys_via_powershell("{END}") or ok
+            ok = self._send_keys_via_pyautogui("{END}") or self._send_keys_via_powershell("{END}") or ok
             time.sleep(0.15)
         if ok:
             log.info("已尝试滚动当前会话到底部 repeats=%s", repeats)
@@ -257,7 +261,7 @@ $r = New-Object Win32Rect+RECT
         return ok
 
     def click_relative(self, rect: WindowRect, x_ratio: float, y_ratio: float) -> bool:
-        self._activate_last_window()
+        self._ensure_foreground()
         point = rect.relative_point(x_ratio, y_ratio)
         log.info(
             "点击窗口相对坐标：ratio=(%.3f, %.3f) abs=(%s, %s) rect=%s",
@@ -270,12 +274,12 @@ $r = New-Object Win32Rect+RECT
         return self._click_point_via_pyautogui(*point) or self._click_point_via_powershell(*point)
 
     def click_screen(self, x: int, y: int) -> bool:
-        self._activate_last_window()
+        self._ensure_foreground()
         log.info("点击屏幕坐标：abs=(%s, %s)", x, y)
         return self._click_point_via_pyautogui(x, y) or self._click_point_via_powershell(x, y)
 
     def right_click_relative(self, rect: WindowRect, x_ratio: float, y_ratio: float) -> bool:
-        self._activate_last_window()
+        self._ensure_foreground()
         point = rect.relative_point(x_ratio, y_ratio)
         log.info(
             "右键点击窗口相对坐标：ratio=(%.3f, %.3f) abs=(%s, %s) rect=%s",
@@ -285,14 +289,14 @@ $r = New-Object Win32Rect+RECT
             point[1],
             rect,
         )
-        return self._right_click_point_via_powershell(*point)
+        return self._right_click_point_via_pyautogui(*point) or self._right_click_point_via_powershell(*point)
 
     def send_keys(self, keys: str) -> bool:
-        self._activate_last_window()
-        return self._send_keys_via_powershell(keys)
+        self._ensure_foreground()
+        return self._send_keys_via_pyautogui(keys) or self._send_keys_via_powershell(keys)
 
     def mouse_wheel_relative(self, rect: WindowRect, x_ratio: float, y_ratio: float, delta: int) -> bool:
-        self._activate_last_window()
+        self._ensure_foreground()
         point = rect.relative_point(x_ratio, y_ratio)
         log.info(
             "滚动窗口相对坐标：ratio=(%.3f, %.3f) abs=(%s, %s) delta=%s rect=%s",
@@ -308,9 +312,38 @@ $r = New-Object Win32Rect+RECT
     def activate(self) -> bool:
         return self._activate_last_window()
 
+    def _is_last_window_foreground(self) -> bool:
+        if self._last_hwnd is None:
+            return False
+        try:
+            import ctypes
+
+            return int(ctypes.windll.user32.GetForegroundWindow()) == self._last_hwnd
+        except Exception:
+            return False
+
+    def _ensure_foreground(self) -> bool:
+        if self._is_last_window_foreground():
+            return True
+        return self._activate_last_window()
+
     def _activate_last_window(self) -> bool:
         if self._last_hwnd is None:
             return False
+        try:
+            import ctypes
+
+            user32 = ctypes.windll.user32
+            hwnd = ctypes.c_void_p(self._last_hwnd)
+            user32.ShowWindow(hwnd, 3)
+            user32.BringWindowToTop(hwnd)
+            activated = bool(user32.SetForegroundWindow(hwnd))
+            if activated or self._is_last_window_foreground():
+                time.sleep(0.08)
+                log.info("Win32 激活企业微信窗口完成：hwnd=%s", self._last_hwnd)
+                return True
+        except Exception as exc:
+            log.debug("Win32 激活企业微信窗口失败，尝试 PowerShell fallback：%s", exc)
         powershell = powershell_exe()
         if powershell is None:
             return False
@@ -332,6 +365,30 @@ $h = [IntPtr]$Hwnd
 Start-Sleep -Milliseconds 120
 """.strip()
         return self._run_temp_powershell(script, ["-Hwnd", str(self._last_hwnd)])
+
+    def _send_keys_via_pyautogui(self, keys: str) -> bool:
+        try:
+            import pyautogui
+
+            normalized = keys.strip()
+            if normalized.startswith("{") and normalized.endswith("}"):
+                normalized = normalized[1:-1]
+            key_name = normalized.lower()
+            aliases = {
+                "esc": "esc",
+                "escape": "esc",
+                "end": "end",
+                "enter": "enter",
+                "return": "enter",
+            }
+            if key_name not in aliases:
+                return False
+            pyautogui.press(aliases[key_name])
+            log.info("pyautogui 按键完成：key=%s", aliases[key_name])
+            return True
+        except Exception as exc:
+            log.debug("pyautogui 按键失败：%s", exc)
+            return False
 
     def _send_keys_via_powershell(self, keys: str) -> bool:
         powershell = powershell_exe()
@@ -400,6 +457,20 @@ Start-Sleep -Milliseconds 50
             return True
         except Exception as exc:
             log.debug("pyautogui 滚轮失败：%s", exc)
+            return False
+
+    def _right_click_point_via_pyautogui(self, x: int, y: int) -> bool:
+        try:
+            import pyautogui
+
+            log.info("pyautogui 右键点击开始：abs=(%s, %s)", x, y)
+            pyautogui.moveTo(x, y, duration=0.05)
+            pyautogui.rightClick(x, y)
+            current = pyautogui.position()
+            log.info("pyautogui 右键点击完成：requested=(%s, %s) cursor=(%s, %s)", x, y, current.x, current.y)
+            return True
+        except Exception as exc:
+            log.debug("pyautogui 右键点击失败：%s", exc)
             return False
 
     def _right_click_point_via_powershell(self, x: int, y: int) -> bool:

@@ -1,24 +1,22 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
 import queue
 import subprocess
 import threading
 import time
 from datetime import datetime
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from .config import AppConfig, load_config
 from .forward_flow import FlowResult, ForwardFlow
-from .groups import limit_groups, load_groups_csv
-from .models import TargetGroup, TargetStatus
 from .powershell import terminate_active_powershell
 from .safety import StopController
 from .screen import ScreenInspector
-from .storage import StateStore
 from .wecom_window import WeComWindow
 
 log = logging.getLogger(__name__)
@@ -27,12 +25,10 @@ log = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class GuiRunOptions:
     config_path: Path
-    groups_path: Path
-    db_path: Path
     log_file: Path
     screenshot_dir: Path
+    send_count: int
     dry_run: bool = True
-    max_total_send: int | None = None
     batch_size: int | None = None
     batch_interval_sec: float | None = None
     confirm_real_send: bool = False
@@ -42,12 +38,8 @@ class GuiRunOptions:
 @dataclass(frozen=True)
 class RunInspection:
     config: AppConfig
-    groups: list[TargetGroup]
-    limited_groups: list[TargetGroup]
-    original_count: int
-    limited_count: int
-    has_uncertain: bool
-    uncertain_targets: list[str]
+    send_count: int
+    batch_count: int
     ocr_warning: str | None = None
     source_check: SourceSelectionInspection | None = None
 
@@ -117,8 +109,6 @@ def validate_real_send_ready(*, dry_run: bool, confirm_send: bool, confirm_revie
 
 def _apply_config_overrides(config: AppConfig, options: GuiRunOptions) -> AppConfig:
     overrides: dict[str, Any] = {"dry_run": options.dry_run}
-    if options.max_total_send is not None:
-        overrides["max_total_send"] = int(options.max_total_send)
     if options.batch_size is not None:
         overrides["batch_size"] = int(options.batch_size)
     if options.batch_interval_sec is not None:
@@ -140,28 +130,42 @@ def inspect_run_setup(options: GuiRunOptions) -> RunInspection:
         allow_real_send=not options.dry_run,
     )
     config = _apply_config_overrides(config, options)
-    groups = load_groups_csv(options.groups_path)
-    limited = limit_groups(groups, config.max_total_send)
-
-    with StateStore(options.db_path) as store:
-        statuses = store.get_statuses([group.group_name for group in limited])
-    uncertain = [
-        name
-        for name, status in statuses.items()
-        if status == TargetStatus.UNCERTAIN or status == str(TargetStatus.UNCERTAIN)
-    ]
+    if options.send_count <= 0:
+        raise ValueError("发送数量必须 > 0")
 
     ocr_warning = _check_ocr_model_warning(config, options.screenshot_dir)
     return RunInspection(
         config=config,
-        groups=groups,
-        limited_groups=limited,
-        original_count=len(groups),
-        limited_count=len(limited),
-        has_uncertain=bool(uncertain),
-        uncertain_targets=uncertain,
+        send_count=options.send_count,
+        batch_count=(options.send_count + config.batch_size - 1) // config.batch_size,
         ocr_warning=ocr_warning,
     )
+
+
+def write_run_snapshot(options: GuiRunOptions, inspection: RunInspection) -> Path:
+    snapshot_dir = options.log_file.parent / "run_snapshots"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    target = snapshot_dir / f"run_{timestamp}.json"
+    source_check = None
+    if inspection.source_check is not None:
+        source_check = {
+            **asdict(inspection.source_check),
+            "screenshot": str(inspection.source_check.screenshot),
+        }
+    payload = {
+        "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "config_path": str(options.config_path.resolve()),
+        "log_file": str(options.log_file.resolve()),
+        "screenshot_dir": str(options.screenshot_dir.resolve()),
+        "send_count": inspection.send_count,
+        "batch_count": inspection.batch_count,
+        "effective_config": asdict(inspection.config),
+        "source_check": source_check,
+    }
+    target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    log.info("本次运行参数快照已保存：%s", target)
+    return target
 
 
 def _check_ocr_model_warning(config: AppConfig, screenshot_dir: Path) -> str | None:
@@ -365,19 +369,17 @@ class WeComRpaApp:
 
         self.status_var = tk.StringVar(value="未启动")
         self.config_var = tk.StringVar(value=str(self._default_config_path()))
-        self.groups_var = tk.StringVar(value="data/groups.example.csv")
-        self.db_var = tk.StringVar(value="data/wecom_rpa.sqlite3")
         self.log_file_var = tk.StringVar(value="logs/wecom_rpa.log")
         self.screenshot_dir_var = tk.StringVar(value="screenshots")
         self.mode_var = tk.StringVar(value="dry_run")
-        self.max_total_var = tk.StringVar(value="")
+        self.send_count_var = tk.StringVar(value="")
         self.batch_size_var = tk.StringVar(value="")
         self.batch_interval_var = tk.StringVar(value="")
         self.confirm_real_var = tk.BooleanVar(value=False)
         self.confirm_review_var = tk.BooleanVar(value=False)
         self.source_ready_var = tk.BooleanVar(value=False)
         self.summary_var = tk.StringVar(value="尚未检查环境")
-        self.progress_var = tk.StringVar(value="当前批次: -    已发送: 0    跳过: 0    uncertain: 0")
+        self.progress_var = tk.StringVar(value="当前批次: -    本次已确认发送: 0")
         self.latest_screenshot_var = tk.StringVar(value="最近截图: -")
 
         self._build_ui()
@@ -429,30 +431,28 @@ class WeComRpaApp:
         params.columnconfigure(1, weight=1)
 
         self._file_row(params, 0, "配置文件", self.config_var, self._browse_config)
-        self._file_row(params, 1, "群列表 CSV", self.groups_var, self._browse_groups)
-        self._file_row(params, 2, "状态库 DB", self.db_var, self._browse_db)
-        self._file_row(params, 3, "日志文件", self.log_file_var, self._browse_log)
-        self._file_row(params, 4, "截图目录", self.screenshot_dir_var, self._browse_screenshot_dir)
+        self._file_row(params, 1, "日志文件", self.log_file_var, self._browse_log)
+        self._file_row(params, 2, "截图目录", self.screenshot_dir_var, self._browse_screenshot_dir)
 
         mode_frame = ttk.Frame(params)
-        mode_frame.grid(row=5, column=0, columnspan=3, sticky="w", pady=(10, 4))
+        mode_frame.grid(row=3, column=0, columnspan=3, sticky="w", pady=(10, 4))
         ttk.Label(mode_frame, text="运行模式").grid(row=0, column=0, padx=(0, 12))
         ttk.Radiobutton(mode_frame, text="Dry-run 自检", variable=self.mode_var, value="dry_run", command=self._invalidate_check).grid(row=0, column=1)
         ttk.Radiobutton(mode_frame, text="真实发送", variable=self.mode_var, value="real_send", command=self._invalidate_check).grid(row=0, column=2, padx=(12, 0))
 
         overrides = ttk.LabelFrame(params, text="覆盖参数", padding=8)
-        overrides.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(8, 4))
+        overrides.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(8, 4))
         for column in range(6):
             overrides.columnconfigure(column, weight=1)
-        ttk.Label(overrides, text="max_total_send").grid(row=0, column=0, sticky="w")
-        ttk.Entry(overrides, textvariable=self.max_total_var, width=8).grid(row=0, column=1, sticky="w")
+        ttk.Label(overrides, text="发送数量").grid(row=0, column=0, sticky="w")
+        ttk.Entry(overrides, textvariable=self.send_count_var, width=8).grid(row=0, column=1, sticky="w")
         ttk.Label(overrides, text="batch_size").grid(row=0, column=2, sticky="w")
         ttk.Entry(overrides, textvariable=self.batch_size_var, width=8).grid(row=0, column=3, sticky="w")
         ttk.Label(overrides, text="间隔秒").grid(row=0, column=4, sticky="w")
         ttk.Entry(overrides, textvariable=self.batch_interval_var, width=8).grid(row=0, column=5, sticky="w")
 
         confirm = ttk.LabelFrame(params, text="真实发送确认", padding=8)
-        confirm.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        confirm.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         ttk.Checkbutton(confirm, text="我理解这会真实发送企业微信消息", variable=self.confirm_real_var, command=self._invalidate_check).grid(row=0, column=0, sticky="w")
         ttk.Checkbutton(confirm, text="我已人工确认源消息和哨兵配置正确", variable=self.confirm_review_var, command=self._invalidate_check).grid(row=1, column=0, sticky="w")
 
@@ -500,11 +500,9 @@ class WeComRpaApp:
 
         for var in (
             self.config_var,
-            self.groups_var,
-            self.db_var,
             self.log_file_var,
             self.screenshot_dir_var,
-            self.max_total_var,
+            self.send_count_var,
             self.batch_size_var,
             self.batch_interval_var,
         ):
@@ -523,20 +521,6 @@ class WeComRpaApp:
         if path:
             self.config_var.set(path)
 
-    def _browse_groups(self) -> None:
-        from tkinter import filedialog
-
-        path = filedialog.askopenfilename(filetypes=[("CSV", "*.csv"), ("All files", "*.*")])
-        if path:
-            self.groups_var.set(path)
-
-    def _browse_db(self) -> None:
-        from tkinter import filedialog
-
-        path = filedialog.asksaveasfilename(defaultextension=".sqlite3", filetypes=[("SQLite", "*.sqlite3 *.db"), ("All files", "*.*")])
-        if path:
-            self.db_var.set(path)
-
     def _browse_log(self) -> None:
         from tkinter import filedialog
 
@@ -554,17 +538,21 @@ class WeComRpaApp:
     def _options_from_form(self) -> GuiRunOptions:
         return GuiRunOptions(
             config_path=Path(self.config_var.get()),
-            groups_path=Path(self.groups_var.get()),
-            db_path=Path(self.db_var.get()),
             log_file=Path(self.log_file_var.get()),
             screenshot_dir=Path(self.screenshot_dir_var.get()),
+            send_count=self._required_positive_int(self.send_count_var.get(), "发送数量"),
             dry_run=self.mode_var.get() == "dry_run",
-            max_total_send=self._optional_int(self.max_total_var.get()),
             batch_size=self._optional_int(self.batch_size_var.get()),
             batch_interval_sec=self._optional_float(self.batch_interval_var.get()),
             confirm_real_send=bool(self.confirm_real_var.get()),
             confirm_source_review=bool(self.confirm_review_var.get()),
         )
+
+    def _required_positive_int(self, value: str, label: str) -> int:
+        parsed = self._optional_int(value)
+        if parsed is None or parsed <= 0:
+            raise ValueError(f"{label}必须是大于 0 的整数")
+        return parsed
 
     def _optional_int(self, value: str) -> int | None:
         value = value.strip()
@@ -607,16 +595,15 @@ class WeComRpaApp:
             self._check_log(
                 "开始检查环境："
                 f"mode={'dry_run' if options.dry_run else 'real_send'} "
-                f"config={options.config_path} groups={options.groups_path} db={options.db_path}",
+                f"config={options.config_path} send_count={options.send_count}",
                 options.log_file,
             )
-            self._check_log("加载配置、群列表和状态库", options.log_file)
+            self._check_log("加载配置和本次运行参数", options.log_file)
             inspection = inspect_run_setup(options)
             self._check_log(
                 "配置检查完成："
-                f"groups={inspection.original_count} limited={inspection.limited_count} "
-                f"batch_size={inspection.config.batch_size} max_total_send={inspection.config.max_total_send} "
-                f"uncertain={len(inspection.uncertain_targets)}",
+                f"send_count={inspection.send_count} batch_count={inspection.batch_count} "
+                f"batch_size={inspection.config.batch_size}",
                 options.log_file,
             )
             self._check_log("开始定位企业微信窗口", options.log_file)
@@ -670,15 +657,13 @@ class WeComRpaApp:
                     f" screenshot={source_check.screenshot}"
                 )
             self.current_inspection = inspection
-            self.last_check_passed = not inspection.has_uncertain
+            self.last_check_passed = True
             self._render_summary(inspection, window_found=window_found)
             self._refresh_start_button()
             self._bring_to_front()
             elapsed = time.monotonic() - start
             self._check_log(f"检查完成：status=ok elapsed={elapsed:.2f}s", options.log_file)
-            if inspection.has_uncertain:
-                messagebox.showwarning("存在 uncertain", "状态库存在 uncertain 目标，请人工复查后再运行。")
-            elif inspection.ocr_warning:
+            if inspection.ocr_warning:
                 messagebox.showwarning("OCR 检查提示", inspection.ocr_warning)
             else:
                 messagebox.showinfo("检查完成", f"源消息勾选检测通过：matched={source_check.matched_count}/{source_check.expected_count}")
@@ -697,7 +682,6 @@ class WeComRpaApp:
         sentinel_text = "未启用"
         if sentinel.enabled:
             sentinel_text = "已启用 " + "、".join(sentinel.names)
-        uncertain = "无" if not inspection.uncertain_targets else "、".join(inspection.uncertain_targets)
         ocr_text = inspection.ocr_warning or "无"
         source_text = "未检查"
         if inspection.source_check is not None:
@@ -714,13 +698,12 @@ class WeComRpaApp:
             "\n".join(
                 [
                     "配置状态: 已加载",
-                    f"群数量: 去重后 {inspection.original_count} / 本次 {inspection.limited_count}",
+                    f"发送数量: {inspection.send_count}",
+                    f"计划批次: {inspection.batch_count}",
                     f"运行模式: {'Dry-run 自检' if inspection.config.dry_run else '真实发送'}",
-                    f"本次上限: {inspection.config.max_total_send}",
                     f"批次大小: {inspection.config.batch_size}",
                     f"批次间隔: {inspection.config.batch_interval_sec} 秒",
                     f"哨兵: {sentinel_text}",
-                    f"uncertain: {uncertain}",
                     f"企业微信窗口: {'已找到' if window_found else '未找到'}",
                     f"源消息勾选检测: {source_text}",
                     f"OCR 提示: {ocr_text}",
@@ -738,7 +721,7 @@ class WeComRpaApp:
         if self.worker and self.worker.is_alive():
             self.start_button.configure(state="disabled")
             return
-        state = "normal" if self.last_check_passed and self.current_inspection and not self.current_inspection.has_uncertain else "disabled"
+        state = "normal" if self.last_check_passed and self.current_inspection else "disabled"
         self.start_button.configure(state=state)
 
     def _bring_to_front(self) -> None:
@@ -767,6 +750,13 @@ class WeComRpaApp:
                 messagebox.showerror("确认失败", "未输入 SEND，真实发送已取消。")
                 return
 
+        try:
+            snapshot_path = write_run_snapshot(options, self.current_inspection)
+            self._append_log(f"本次运行参数快照已保存：{snapshot_path}")
+        except Exception as exc:
+            messagebox.showerror("快照保存失败", f"无法保存本次运行参数快照，运行已取消：{exc}")
+            return
+
         self.stop_controller = StopController(self.current_inspection.config.stop_hotkey)
         self._set_running(True)
         self.worker = threading.Thread(target=self._run_worker, args=(options, self.current_inspection, self.stop_controller), daemon=True)
@@ -777,25 +767,23 @@ class WeComRpaApp:
         result: FlowResult | None = None
         try:
             log.info(
-                "启动运行：dry_run=%s forward_button_ratio=%s source_checkbox_x=%.3f source_checkbox_y=%s targets=%s",
+                "启动运行：dry_run=%s forward_button_ratio=%s source_checkbox_x=%.3f source_checkbox_y=%s send_count=%s",
                 inspection.config.dry_run,
                 inspection.config.source_selection.forward_button_ratio,
                 inspection.config.source_selection.checkbox_x_ratio,
                 [round(y, 3) for y in inspection.config.source_selection.checkbox_y_ratios],
-                len(inspection.limited_groups),
+                inspection.send_count,
             )
-            with StateStore(options.db_path) as store:
-                result = ForwardFlow(
-                    inspection.config,
-                    store,
-                    screenshot_dir=str(options.screenshot_dir),
-                    yes=False,
-                    real_send_allowed=not inspection.config.dry_run,
-                    stop_controller=stop_controller,
-                    install_stop_hotkey=False,
-                    confirm_callback=self._confirm_from_worker,
-                    progress_callback=lambda event: self.ui_queue.put(("progress", event)),
-                ).run(inspection.limited_groups)
+            result = ForwardFlow(
+                inspection.config,
+                screenshot_dir=str(options.screenshot_dir),
+                yes=False,
+                real_send_allowed=not inspection.config.dry_run,
+                stop_controller=stop_controller,
+                install_stop_hotkey=False,
+                confirm_callback=self._confirm_from_worker,
+                progress_callback=lambda event: self.ui_queue.put(("progress", event)),
+            ).run(inspection.send_count)
             self.ui_queue.put(("finished", result))
         except Exception as exc:
             self.ui_queue.put(("failed", exc))
@@ -834,11 +822,16 @@ class WeComRpaApp:
         return bool(payload["answer"])
 
     def _request_stop(self) -> None:
-        self.status_var.set("状态: 正在强制停止")
+        if self.worker is None or not self.worker.is_alive():
+            self.status_var.set("状态: 当前没有正在运行的任务")
+            return
+        self.status_var.set("状态: 正在停止运行，请稍候")
+        self.progress_var.set("已请求停止；当前安全步骤结束后将返回 GUI")
+        self.stop_button.configure(state="disabled")
         if self.stop_controller is not None:
             self.stop_controller.request_stop()
         terminate_active_powershell()
-        os._exit(130)
+        log.warning("GUI 已请求停止当前运行；界面保持打开")
 
     def _process_ui_queue(self) -> None:
         while True:
@@ -867,9 +860,7 @@ class WeComRpaApp:
             batch_no = event.get("batch_no", "-")
             total_batches = event.get("total_batches", "-")
             sent = summary.get("sent", 0)
-            skipped = summary.get("skipped", 0)
-            uncertain = summary.get("uncertain", 0)
-            self.progress_var.set(f"当前批次: {batch_no} / {total_batches}    已发送: {sent}    跳过: {skipped}    uncertain: {uncertain}")
+            self.progress_var.set(f"当前批次: {batch_no} / {total_batches}    本次已确认发送: {sent}")
 
     def _handle_confirm(self, payload: dict[str, Any]) -> None:
         from tkinter import messagebox
@@ -882,8 +873,8 @@ class WeComRpaApp:
 
         self._set_running(False)
         self.status_var.set(f"状态: {result.status}")
-        self.progress_var.set(f"运行完成: run_id={result.run_id} summary={result.summary}")
-        messagebox.showinfo("运行完成", f"run_id={result.run_id}\nstatus={result.status}\nsummary={result.summary}")
+        self.progress_var.set(f"运行完成: summary={result.summary}")
+        messagebox.showinfo("运行完成", f"status={result.status}\nsummary={result.summary}")
 
     def _handle_failed(self, exc: Exception) -> None:
         from tkinter import messagebox

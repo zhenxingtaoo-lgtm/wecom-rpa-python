@@ -56,14 +56,6 @@ class SendLimitError(ValueError):
     pass
 
 
-def assert_send_limit(max_total_send: int, available: int) -> int:
-    if max_total_send <= 0:
-        raise SendLimitError("max_total_send 必须 > 0")
-    if available < 0:
-        raise SendLimitError("available 不能为负数")
-    return min(max_total_send, available)
-
-
 def assert_batch_selection_count(selected_count: int, batch_size: int, *, hard_limit: int = 9) -> None:
     if selected_count < 0:
         raise SendLimitError("selected_count 不能为负数")

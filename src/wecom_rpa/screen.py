@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import json
 import sys
+import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
@@ -79,11 +80,21 @@ class ScreenInspector:
         self.ocr_lang = ocr_lang
         self.ocr_fallback = ocr_fallback
         self.paddle_model_root = Path(paddle_model_root) if paddle_model_root else None
+        self._paddle_ocr = None
         (self.screenshot_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
         (self.screenshot_dir / "errors").mkdir(parents=True, exist_ok=True)
 
     def save_checkpoint(self, name: str, region: Region | None = None) -> Path:
-        return self._save_capture("checkpoints", name, region=region)
+        started = time.monotonic()
+        path = self._save_capture("checkpoints", name, region=region)
+        log.info(
+            "截图操作完成：name=%s region=%s path=%s elapsed=%.3fs",
+            name,
+            region,
+            path,
+            time.monotonic() - started,
+        )
+        return path
 
     def save_fullscreen_checkpoint(self, name: str) -> Path:
         safe_name = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in name).strip("_") or "capture"
@@ -186,6 +197,7 @@ class ScreenInspector:
 
         运行时按配置选择 OCR 后端；PaddleOCR/Tesseract 不可用时可回退 Windows OCR。
         """
+        started = time.monotonic()
         captured_tmp: Path | None = None
         if image_path is None:
             captured_tmp = self.capture(self.screenshot_dir / "checkpoints" / "ocr_scan.png", region=region)
@@ -195,15 +207,37 @@ class ScreenInspector:
             return []
 
         if self.ocr_engine == "none":
-            return []
+            lines: list[OcrLine] = []
+            log.info("OCR 操作完成：engine=none image=%s lines=0 elapsed=%.3fs", image, time.monotonic() - started)
+            return lines
         if self.ocr_engine == "windows":
-            return self._ocr_lines_via_windows_ocr(image)
+            lines = self._ocr_lines_via_windows_ocr(image)
+            log.info(
+                "OCR 操作完成：engine=windows image=%s lines=%s elapsed=%.3fs",
+                image,
+                len(lines),
+                time.monotonic() - started,
+            )
+            return lines
         if self.ocr_engine == "paddleocr":
             lines = self._ocr_lines_via_paddleocr(image)
             if lines or self.ocr_fallback == "none":
+                log.info(
+                    "OCR 操作完成：engine=paddleocr image=%s lines=%s elapsed=%.3fs",
+                    image,
+                    len(lines),
+                    time.monotonic() - started,
+                )
                 return lines
             log.info("PaddleOCR 不可用或未识别到文本，尝试 Windows OCR")
-            return self._ocr_lines_via_windows_ocr(image)
+            lines = self._ocr_lines_via_windows_ocr(image)
+            log.info(
+                "OCR 操作完成：engine=windows_fallback image=%s lines=%s elapsed=%.3fs",
+                image,
+                len(lines),
+                time.monotonic() - started,
+            )
+            return lines
 
         try:
             from PIL import Image  # type: ignore
@@ -257,14 +291,20 @@ class ScreenInspector:
         except Exception as exc:
             log.info("PaddleOCR 依赖不可用：%s", exc)
             return []
-        try:
-            kwargs = self._paddleocr_kwargs()
-            ocr = PaddleOCR(lang=self.ocr_lang, use_textline_orientation=True, **kwargs)
-        except TypeError:
-            ocr = PaddleOCR(lang=self.ocr_lang, **kwargs)
-        except Exception as exc:
-            log.warning("PaddleOCR 初始化失败：%s", exc)
-            return []
+        if self._paddle_ocr is None:
+            init_started = time.monotonic()
+            try:
+                kwargs = self._paddleocr_kwargs()
+                try:
+                    self._paddle_ocr = PaddleOCR(lang=self.ocr_lang, use_textline_orientation=True, **kwargs)
+                except TypeError:
+                    self._paddle_ocr = PaddleOCR(lang=self.ocr_lang, **kwargs)
+            except Exception as exc:
+                log.warning("PaddleOCR 初始化失败：%s", exc)
+                return []
+            log.info("PaddleOCR 初始化完成：elapsed=%.3fs", time.monotonic() - init_started)
+        ocr = self._paddle_ocr
+        infer_started = time.monotonic()
         try:
             if hasattr(ocr, "predict"):
                 raw = ocr.predict(str(image_path))
@@ -273,7 +313,14 @@ class ScreenInspector:
         except Exception as exc:
             log.warning("PaddleOCR 识别失败：%s", exc)
             return []
-        return self._parse_paddleocr_result(raw)
+        lines = self._parse_paddleocr_result(raw)
+        log.info(
+            "PaddleOCR 推理完成：image=%s lines=%s elapsed=%.3fs",
+            image_path,
+            len(lines),
+            time.monotonic() - infer_started,
+        )
+        return lines
 
     def _paddleocr_kwargs(self) -> dict[str, str]:
         root = self._resolve_paddle_model_root()
@@ -425,7 +472,12 @@ $items | ConvertTo-Json -Compress
             log.warning("Windows OCR 异常：%s", exc)
             return []
 
-    def find_selected_checkbox_ratios(self, image_path: str | Path) -> list[tuple[float, float]]:
+    def find_selected_checkbox_ratios(
+        self,
+        image_path: str | Path,
+        *,
+        scan_region_ratio: tuple[float, float, float, float] | None = None,
+    ) -> list[tuple[float, float]]:
         """识别当前窗口截图里已选源消息的蓝色复选框中心点比例。
 
         优先用 Pillow 在当前进程内扫描，避免高 DPI 截图下反复启动 PowerShell。
@@ -434,16 +486,64 @@ $items | ConvertTo-Json -Compress
         image = Path(image_path)
         if not image.exists() or image.suffix.lower() != ".png":
             return []
+        started = time.monotonic()
+        cv_points = self._find_checkbox_components_via_opencv(
+            image,
+            selected=True,
+            scan_region_ratio=scan_region_ratio,
+        )
+        if cv_points is not None:
+            log.info(
+                "蓝色复选框识别完成：backend=opencv image=%s region=%s points=%s elapsed=%.3fs",
+                image,
+                scan_region_ratio,
+                len(cv_points),
+                time.monotonic() - started,
+            )
+            return cv_points
         points = self._find_selected_checkbox_ratios_via_pillow(image)
         if points:
+            log.info(
+                "蓝色复选框识别完成：backend=pillow image=%s points=%s elapsed=%.3fs",
+                image,
+                len(points),
+                time.monotonic() - started,
+            )
             return points
-        return self._find_selected_checkbox_ratios_via_powershell(image)
+        points = self._find_selected_checkbox_ratios_via_powershell(image)
+        log.info(
+            "蓝色复选框识别完成：backend=powershell image=%s points=%s elapsed=%.3fs",
+            image,
+            len(points),
+            time.monotonic() - started,
+        )
+        return points
 
-    def find_checkbox_outline_ratios(self, image_path: str | Path) -> list[tuple[float, float]]:
+    def find_checkbox_outline_ratios(
+        self,
+        image_path: str | Path,
+        *,
+        scan_region_ratio: tuple[float, float, float, float] | None = None,
+    ) -> list[tuple[float, float]]:
         """识别未勾选复选框的灰色方框轮廓中心点比例。"""
         image = Path(image_path)
         if not image.exists() or image.suffix.lower() != ".png":
             return []
+        started = time.monotonic()
+        cv_points = self._find_checkbox_components_via_opencv(
+            image,
+            selected=False,
+            scan_region_ratio=scan_region_ratio,
+        )
+        if cv_points is not None:
+            log.info(
+                "灰色复选框识别完成：backend=opencv image=%s region=%s points=%s elapsed=%.3fs",
+                image,
+                scan_region_ratio,
+                len(cv_points),
+                time.monotonic() - started,
+            )
+            return cv_points
         try:
             from PIL import Image  # type: ignore
         except Exception as exc:
@@ -503,7 +603,14 @@ $items | ConvertTo-Json -Compress
                     height,
                     [(round(x, 3), round(y, 3)) for x, y in points],
                 )
-                return sorted(points, key=lambda point: point[1])
+                result = sorted(points, key=lambda point: point[1])
+                log.info(
+                    "灰色复选框识别完成：image=%s points=%s elapsed=%.3fs",
+                    image,
+                    len(result),
+                    time.monotonic() - started,
+                )
+                return result
         except Exception as exc:
             log.debug("Pillow 灰色复选框轮廓扫描失败：%s", exc)
             return []
@@ -528,6 +635,75 @@ $items | ConvertTo-Json -Compress
                 continue
             deduped.append(point)
         return deduped
+
+    def _find_checkbox_components_via_opencv(
+        self,
+        image_path: Path,
+        *,
+        selected: bool,
+        scan_region_ratio: tuple[float, float, float, float] | None,
+    ) -> list[tuple[float, float]] | None:
+        try:
+            import cv2  # type: ignore
+            import numpy as np  # type: ignore
+        except Exception as exc:
+            log.debug("OpenCV/NumPy 不可用，回退复选框像素扫描：%s", exc)
+            return None
+
+        try:
+            bitmap = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+            if bitmap is None:
+                return None
+            height, width = bitmap.shape[:2]
+            left = 0
+            top = 0
+            right = width
+            bottom = height
+            if scan_region_ratio is not None:
+                x_ratio, y_ratio, width_ratio, height_ratio = scan_region_ratio
+                left = max(0, min(width - 1, round(width * x_ratio)))
+                top = max(0, min(height - 1, round(height * y_ratio)))
+                right = max(left + 1, min(width, round(width * (x_ratio + width_ratio))))
+                bottom = max(top + 1, min(height, round(height * (y_ratio + height_ratio))))
+
+            roi = bitmap[top:bottom, left:right]
+            if selected:
+                mask = cv2.inRange(
+                    roi,
+                    np.array((171, 91, 0), dtype=np.uint8),
+                    np.array((255, 189, 99), dtype=np.uint8),
+                )
+                min_count = 40
+            else:
+                channel_min = roi.min(axis=2)
+                channel_max = roi.max(axis=2)
+                mask = (
+                    (channel_min >= 90)
+                    & (channel_max <= 205)
+                    & ((channel_max - channel_min) <= 32)
+                ).astype(np.uint8) * 255
+                min_count = 20
+
+            component_count, _labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=4)
+            min_size, max_size, max_delta = self._checkbox_size_limits(width, height)
+            points: list[tuple[float, float]] = []
+            for index in range(1, component_count):
+                component_left, component_top, box_width, box_height, pixel_count = (
+                    int(value) for value in stats[index]
+                )
+                if (
+                    pixel_count < min_count
+                    or not min_size <= box_width <= max_size
+                    or not min_size <= box_height <= max_size
+                    or abs(box_width - box_height) > max_delta
+                ):
+                    continue
+                center_x, center_y = centroids[index]
+                points.append(((left + float(center_x)) / width, (top + float(center_y)) / height))
+            return sorted(self._dedupe_ratio_points(points), key=lambda point: point[1])
+        except Exception as exc:
+            log.debug("OpenCV 复选框连通域识别失败，回退像素扫描：%s", exc)
+            return None
 
     def _find_selected_checkbox_ratios_via_pillow(self, image_path: Path) -> list[tuple[float, float]]:
         try:

@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from wecom_rpa.safety import StopController, assert_batch_selection_count, assert_send_limit
+from wecom_rpa.safety import StopController, assert_batch_selection_count
 from wecom_rpa.screen import OcrLine, ScreenInspector
 from wecom_rpa.wecom_window import WeComWindow, WindowRect
 from wecom_rpa import powershell
@@ -20,8 +20,6 @@ class SafetyWindowScreenTest(unittest.TestCase):
         self.assertFalse(stop.should_stop())
 
     def test_send_limit_and_batch_count_validation(self):
-        self.assertEqual(assert_send_limit(5, 12), 5)
-        self.assertEqual(assert_send_limit(20, 12), 12)
         assert_batch_selection_count(9, 9)
         with self.assertRaisesRegex(ValueError, "batch_size"):
             assert_batch_selection_count(1, 10)
@@ -103,6 +101,25 @@ class SafetyWindowScreenTest(unittest.TestCase):
             self.assertAlmostEqual(points[0][1], 1177.5 / 1800, places=3)
             self.assertAlmostEqual(points[1][1], 1527.5 / 1800, places=3)
 
+    def test_selected_checkbox_detection_limits_scan_region(self):
+        with tempfile.TemporaryDirectory() as d:
+            from PIL import Image, ImageDraw
+
+            image_path = Path(d) / "region.png"
+            image = Image.new("RGB", (1000, 1000), (245, 247, 250))
+            draw = ImageDraw.Draw(image)
+            draw.rectangle((100, 400, 119, 419), fill=(0, 120, 230))
+            draw.rectangle((800, 400, 819, 419), fill=(0, 120, 230))
+            image.save(image_path)
+
+            points = ScreenInspector(Path(d) / "screenshots").find_selected_checkbox_ratios(
+                image_path,
+                scan_region_ratio=(0.70, 0.30, 0.25, 0.30),
+            )
+
+            self.assertEqual(len(points), 1)
+            self.assertAlmostEqual(points[0][0], 809.5 / 1000, places=3)
+
     def test_checkbox_outline_detection_handles_picker_rows(self):
         with tempfile.TemporaryDirectory() as d:
             from PIL import Image, ImageDraw
@@ -151,6 +168,23 @@ class SafetyWindowScreenTest(unittest.TestCase):
     def test_windows_path_does_not_use_wslpath(self):
         with mock.patch.object(powershell.shutil, "which", side_effect=AssertionError("wslpath should not be used")):
             self.assertEqual(powershell.windows_path(Path("C:/tmp/a.ps1")), str(Path("C:/tmp/a.ps1")))
+
+    def test_foreground_check_does_not_reactivate_active_window(self):
+        window = WeComWindow("企业微信")
+        window._last_hwnd = 123
+        with mock.patch.object(window, "_is_last_window_foreground", return_value=True), mock.patch.object(
+            window, "_activate_last_window", return_value=True
+        ) as activate:
+            self.assertTrue(window._ensure_foreground())
+        activate.assert_not_called()
+
+    def test_click_uses_pyautogui_without_powershell_when_available(self):
+        window = WeComWindow("企业微信")
+        with mock.patch.object(window, "_ensure_foreground", return_value=True), mock.patch.object(
+            window, "_click_point_via_pyautogui", return_value=True
+        ), mock.patch.object(window, "_click_point_via_powershell", return_value=True) as powershell_click:
+            self.assertTrue(window.click_screen(100, 200))
+        powershell_click.assert_not_called()
 
     def test_powershell_exe_does_not_fallback_to_wsl_mount(self):
         with mock.patch.object(powershell.shutil, "which", return_value=None), mock.patch.object(

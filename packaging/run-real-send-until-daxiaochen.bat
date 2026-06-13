@@ -19,11 +19,16 @@ if /I not "%CONFIRM%"=="SEND" (
   pause
   exit /b 1
 )
+set /p SEND_COUNT=Enter the maximum number of conversations to send:
+if "%SEND_COUNT%"=="" (
+  echo Send count is required.
+  pause
+  exit /b 1
+)
 
 app\wecom-rpa.exe ^
   --config config\real_send_until_daxiaochen.yaml ^
-  --groups data\real_send_sentinel_50.csv ^
-  --db data\wecom_rpa.sqlite3 ^
+  --send-count %SEND_COUNT% ^
   --log-file logs\wecom_rpa.log ^
   --screenshot-dir screenshots\real_send ^
   --yes ^

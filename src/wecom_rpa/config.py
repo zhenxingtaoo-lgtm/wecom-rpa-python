@@ -69,10 +69,8 @@ class SourceSelectionConfig:
 
 @dataclass(frozen=True)
 class AppConfig:
-    max_total_send: int
     batch_size: int = 9
     batch_interval_sec: float = 5
-    max_retry_per_group: int = 2
     stop_hotkey: str = "ctrl+alt+q"
     dry_run: bool = True
     require_confirm_before_start: bool = True
@@ -84,18 +82,14 @@ class AppConfig:
     source_selection: SourceSelectionConfig = field(default_factory=SourceSelectionConfig)
 
     def validate(self, *, allow_real_send: bool = False) -> None:
-        if self.max_total_send <= 0:
-            raise ValueError("max_total_send 必须 > 0")
         if self.batch_size <= 0:
             raise ValueError("batch_size 必须 > 0")
         if self.batch_size > 9:
             raise ValueError("batch_size 不能超过 9（企业微信单次最多 9 个会话）")
         if self.batch_interval_sec < 0:
             raise ValueError("batch_interval_sec 不能为负数")
-        if self.max_retry_per_group < 0:
-            raise ValueError("max_retry_per_group 不能为负数")
-        if self.recipient_selection.mode not in {"search_by_name", "bottom_of_picker"}:
-            raise ValueError("recipient_selection.mode 必须是 search_by_name 或 bottom_of_picker")
+        if self.recipient_selection.mode != "bottom_of_picker":
+            raise ValueError("recipient_selection.mode 当前只支持 bottom_of_picker")
         if self.ocr.engine not in {"paddleocr", "tesseract", "windows", "none"}:
             raise ValueError("ocr.engine 必须是 paddleocr、tesseract、windows 或 none")
         if self.ocr.fallback not in {"windows", "none"}:
@@ -146,17 +140,12 @@ def load_config(path: str | Path, *, force_dry_run: bool | None = None, allow_re
     raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
     if not isinstance(raw, dict):
         raise ValueError("配置文件顶层必须是对象")
-    if "max_total_send" not in raw:
-        raise ValueError("配置缺少 max_total_send")
-
     if force_dry_run is not None:
         raw["dry_run"] = force_dry_run
 
     cfg = AppConfig(
-        max_total_send=int(raw["max_total_send"]),
         batch_size=int(raw.get("batch_size", 9)),
         batch_interval_sec=float(raw.get("batch_interval_sec", 5)),
-        max_retry_per_group=int(raw.get("max_retry_per_group", 2)),
         stop_hotkey=str(raw.get("stop_hotkey", "ctrl+alt+q")),
         dry_run=bool(raw.get("dry_run", True)),
         require_confirm_before_start=bool(raw.get("require_confirm_before_start", True)),
