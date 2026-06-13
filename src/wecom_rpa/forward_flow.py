@@ -1075,31 +1075,24 @@ class ForwardFlow:
 
     def _record_exact_source_selection(self, image_path, rect: WindowRect | None = None) -> None:
         selected_points = self._source_selected_checkbox_ratios_in_window(image_path, rect) if rect is not None else self._source_selected_checkbox_ratios(image_path)
-        expected_count = len(self.source_checkbox_y_ratios)
-        if len(selected_points) != expected_count and rect is not None:
-            fallback_points = self._source_selected_checkbox_ratios_from_fullscreen(rect, "source_fullscreen_probe")
-            if fallback_points:
+        if not selected_points and rect is not None:
+            selected_points = self._source_selected_checkbox_ratios_from_fullscreen(rect, "source_fullscreen_probe")
+            if selected_points:
                 log.info(
-                    "窗口裁剪图源消息蓝勾数量不匹配，已使用全屏截图 fallback：crop=%s fullscreen=%s",
+                    "窗口裁剪图未检测到源消息蓝勾，已通过全屏截图 fallback 获得 %s 个",
                     len(selected_points),
-                    len(fallback_points),
                 )
-                selected_points = fallback_points
-        if len(selected_points) != expected_count:
-            log.warning(
-                "源消息蓝色勾选框数量不等于配置数量：expected=%s actual=%s points=%s",
-                expected_count,
-                len(selected_points),
-                [(round(x, 3), round(y, 3)) for x, y in selected_points],
-            )
+        if not selected_points:
+            log.warning("未检测到任何源消息蓝色勾选框，请确认已手动勾选待转发消息")
             if self.real_send_allowed:
-                raise RuntimeError(f"真实发送前源消息蓝色勾选框数量不是 {expected_count} 个，已停止以避免误发")
+                raise RuntimeError("未检测到源消息蓝色勾选框，已停止以避免误发")
             return
         source_points = sorted(selected_points, key=lambda item: item[1], reverse=True)
         self.source_checkbox_x_ratio = sum(x for x, _ in source_points) / len(source_points)
         self.source_checkbox_y_ratios = [y for _, y in source_points]
         log.info(
-            "已记录源消息复选框：x_ratio=%.3f y_ratios=%s",
+            "已记录源消息复选框：count=%s x_ratio=%.3f y_ratios=%s",
+            len(source_points),
             self.source_checkbox_x_ratio,
             [round(y, 3) for y in self.source_checkbox_y_ratios],
         )
