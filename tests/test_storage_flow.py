@@ -109,11 +109,14 @@ class ForwardFlowTest(unittest.TestCase):
 
     def test_source_context_menu_candidates_use_same_message_rows(self):
         flow = ForwardFlow(AppConfig(), install_stop_hotkey=False)
-        flow.source_checkbox_y_ratios = [0.708, 0.527]
+        flow.source_checkbox_y_ratios = [0.708, 0.527, 0.117]
 
         candidates = flow._source_context_menu_candidates()
 
-        self.assertEqual(candidates, [(0.527, 0.75, 0.527), (0.708, 0.75, 0.708)])
+        self.assertEqual(
+            candidates,
+            [(0.117, 0.75, 0.117), (0.527, 0.75, 0.527), (0.708, 0.75, 0.708)],
+        )
 
     def test_source_context_menu_region_is_local_to_click(self):
         flow = ForwardFlow(AppConfig(), install_stop_hotkey=False)

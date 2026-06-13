@@ -5,7 +5,15 @@ import unittest
 import json
 from unittest import mock
 
-from wecom_rpa.gui import GuiRunOptions, WeComRpaApp, compute_gui_layout, inspect_run_setup, validate_real_send_ready, write_run_snapshot
+from wecom_rpa.gui import (
+    GuiRunOptions,
+    WeComRpaApp,
+    compute_gui_layout,
+    inspect_run_setup,
+    select_source_checkbox_column,
+    validate_real_send_ready,
+    write_run_snapshot,
+)
 
 
 class GuiSupportTest(unittest.TestCase):
@@ -89,6 +97,23 @@ class GuiSupportTest(unittest.TestCase):
             self.assertEqual(payload["send_count"], 12)
             self.assertEqual(payload["batch_count"], 2)
             self.assertEqual(payload["effective_config"]["batch_size"], 9)
+
+    def test_source_checkbox_column_uses_all_detected_message_rows(self):
+        points = [
+            (0.262, 0.117),
+            (0.262, 0.290),
+            (0.262, 0.499),
+            (0.262, 0.671),
+            (0.300, 0.039),
+            (0.386, 0.971),
+        ]
+
+        selected = select_source_checkbox_column(points)
+
+        self.assertEqual(
+            selected,
+            [(0.262, 0.117), (0.262, 0.290), (0.262, 0.499), (0.262, 0.671)],
+        )
 
 
 if __name__ == "__main__":

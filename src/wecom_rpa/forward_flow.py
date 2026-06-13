@@ -1158,9 +1158,9 @@ class ForwardFlow:
             (x_ratio, y_ratio)
             for x_ratio, y_ratio in self.screen.find_selected_checkbox_ratios(
                 image_path,
-                scan_region_ratio=(0.18, 0.12, 0.32, 0.80),
+                scan_region_ratio=(0.18, 0.04, 0.32, 0.88),
             )
-            if 0.18 <= x_ratio <= 0.50 and 0.12 <= y_ratio <= 0.92
+            if 0.18 <= x_ratio <= 0.50 and 0.04 <= y_ratio <= 0.92
         ]
 
     def _source_selected_checkbox_ratios_in_window(self, image_path, rect: WindowRect | None) -> list[tuple[float, float]]:
@@ -1212,7 +1212,7 @@ class ForwardFlow:
                     continue
                 local_x = (abs_x - scaled_left) / scaled_width
                 local_y = (abs_y - scaled_top) / scaled_height
-                if 0.18 <= local_x <= 0.50 and 0.12 <= local_y <= 0.92:
+                if 0.18 <= local_x <= 0.50 and 0.04 <= local_y <= 0.92:
                     converted.append((local_x, local_y))
             return converted
 
@@ -1312,7 +1312,7 @@ class ForwardFlow:
         # 复选框中心与对应消息气泡位于同一行。只在每条源消息的正文安全区域
         # 尝试一次，避免旧逻辑的 40 个偏移坐标触发大量无效全屏 OCR。
         return [
-            (checkbox_y, 0.75, min(0.90, max(0.16, checkbox_y)))
+            (checkbox_y, 0.75, min(0.90, max(0.06, checkbox_y)))
             for checkbox_y in sorted(self.source_checkbox_y_ratios)
         ]
 

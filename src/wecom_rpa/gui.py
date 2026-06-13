@@ -196,45 +196,70 @@ def inspect_source_selection(config: AppConfig, screenshot_dir: Path, rect: Any)
         paddle_model_root=config.ocr.model_root,
     )
     screenshot = inspector.save_fullscreen_checkpoint("gui_source_selection_check")
-    expected = len(config.source_selection.checkbox_y_ratios)
     if screenshot.suffix.lower() != ".png":
         return SourceSelectionInspection(
             selected=False,
             screenshot=screenshot,
-            expected_count=expected,
+            expected_count=0,
             matched_count=0,
             points=[],
         )
 
     image_size = inspector.image_size(screenshot)
-    points = convert_fullscreen_checkbox_ratios_to_window(inspector, screenshot, rect, image_size)
-    fullscreen_source_points = [
+    converted_points = convert_fullscreen_checkbox_ratios_to_window(inspector, screenshot, rect, image_size)
+    fullscreen_points = [
         (x_ratio, y_ratio)
         for x_ratio, y_ratio in inspector.find_selected_checkbox_ratios(screenshot)
-        if 0.18 <= x_ratio <= 0.50 and 0.12 <= y_ratio <= 0.85
+        if 0.18 <= x_ratio <= 0.50 and 0.04 <= y_ratio <= 0.90
     ]
-    x_tolerance = 0.06
-    y_tolerance = 0.04
-    matched = 0
-    for expected_y in config.source_selection.checkbox_y_ratios:
-        if any(
-            abs(x_ratio - config.source_selection.checkbox_x_ratio) <= x_tolerance
-            and abs(y_ratio - expected_y) <= y_tolerance
-            for x_ratio, y_ratio in points
-        ):
-            matched += 1
-    if matched != expected and len(fullscreen_source_points) >= expected:
+    points = select_source_checkbox_column(converted_points)
+    fullscreen_source_points = select_source_checkbox_column(fullscreen_points)
+    if len(fullscreen_source_points) > len(points):
         points = fullscreen_source_points
-        matched = expected
+    detected_count = len(points)
     forward_button_ratio = detect_forward_button_ratio(inspector, screenshot, rect)
     return SourceSelectionInspection(
-        selected=matched == expected,
+        selected=detected_count > 0,
         screenshot=screenshot,
-        expected_count=expected,
-        matched_count=matched,
+        expected_count=detected_count,
+        matched_count=detected_count,
         points=points,
         forward_button_ratio=forward_button_ratio,
     )
+
+
+def select_source_checkbox_column(
+    points: list[tuple[float, float]],
+    *,
+    x_tolerance: float = 0.018,
+) -> list[tuple[float, float]]:
+    candidates = [
+        (x_ratio, y_ratio)
+        for x_ratio, y_ratio in points
+        if 0.18 <= x_ratio <= 0.50 and 0.04 <= y_ratio <= 0.90
+    ]
+    if not candidates:
+        return []
+
+    clusters: list[list[tuple[float, float]]] = []
+    for point in sorted(candidates, key=lambda item: item[0]):
+        matching = next(
+            (
+                cluster
+                for cluster in clusters
+                if abs(point[0] - sum(x for x, _y in cluster) / len(cluster)) <= x_tolerance
+            ),
+            None,
+        )
+        if matching is None:
+            clusters.append([point])
+        else:
+            matching.append(point)
+    source_cluster = max(
+        clusters,
+        key=lambda cluster: (len(cluster), -sum(x for x, _y in cluster) / len(cluster)),
+    )
+    return sorted(source_cluster, key=lambda item: item[1])
 
 
 def detect_forward_button_ratio(inspector: ScreenInspector, image_path: Path, rect: Any) -> tuple[float, float] | None:
@@ -303,7 +328,7 @@ def convert_fullscreen_checkbox_ratios_to_window(
                 continue
             local_x = (abs_x - scaled_left) / scaled_width
             local_y = (abs_y - scaled_top) / scaled_height
-            if 0.18 <= local_x <= 0.50 and 0.20 <= local_y <= 0.90:
+            if 0.18 <= local_x <= 0.50 and 0.04 <= local_y <= 0.90:
                 key = (round(local_x * 10000), round(local_y * 10000))
                 if key in seen:
                     continue
@@ -647,8 +672,7 @@ class WeComRpaApp:
             if not source_check.selected:
                 points = [(round(x, 3), round(y, 3)) for x, y in source_check.points]
                 raise RuntimeError(
-                    "检查失败：未检测到配置要求的待转发消息蓝色勾选框。"
-                    f" expected={source_check.expected_count} matched={source_check.matched_count} "
+                    "检查失败：未检测到待转发消息蓝色勾选框。"
                     f"points={points} screenshot={source_check.screenshot}"
                 )
             if source_check.forward_button_ratio is None:
@@ -666,7 +690,7 @@ class WeComRpaApp:
             if inspection.ocr_warning:
                 messagebox.showwarning("OCR 检查提示", inspection.ocr_warning)
             else:
-                messagebox.showinfo("检查完成", f"源消息勾选检测通过：matched={source_check.matched_count}/{source_check.expected_count}")
+                messagebox.showinfo("检查完成", f"源消息勾选检测通过：识别到 {source_check.matched_count} 条")
         except Exception as exc:
             self.current_inspection = None
             self.last_check_passed = False
