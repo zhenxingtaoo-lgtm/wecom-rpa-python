@@ -120,6 +120,57 @@ class SafetyWindowScreenTest(unittest.TestCase):
             self.assertEqual(len(points), 1)
             self.assertAlmostEqual(points[0][0], 809.5 / 1000, places=3)
 
+    def test_source_checkbox_filter_excludes_select_to_here_marker(self):
+        with tempfile.TemporaryDirectory() as d:
+            from PIL import Image, ImageDraw
+
+            image_path = Path(d) / "select_to_here.png"
+            image = Image.new("RGB", (1440, 900), (245, 247, 250))
+            draw = ImageDraw.Draw(image)
+            blue = (20, 120, 235)
+            checkbox_x = 380
+            for center_y in (110, 430, 680):
+                draw.rectangle(
+                    (checkbox_x - 10, center_y - 10, checkbox_x + 10, center_y + 10),
+                    fill=blue,
+                )
+            # Simulate the blue arrow label immediately to the right of the top marker.
+            for offset in range(0, 95, 15):
+                draw.rectangle(
+                    (checkbox_x + 20 + offset, 101, checkbox_x + 28 + offset, 119),
+                    fill=blue,
+                )
+            image.save(image_path)
+
+            inspector = ScreenInspector(Path(d) / "screenshots")
+            raw_points = inspector.find_selected_checkbox_ratios(image_path)
+            filtered = inspector.filter_source_checkbox_marker_points(image_path, raw_points)
+
+            self.assertEqual(len(filtered), 2)
+            self.assertTrue(all(y_ratio > 0.30 for _x_ratio, y_ratio in filtered))
+
+    def test_source_checkbox_filter_removes_all_marker_text_fragments(self):
+        with tempfile.TemporaryDirectory() as d:
+            from PIL import Image, ImageDraw
+
+            image_path = Path(d) / "select_to_here_fragments.png"
+            image = Image.new("RGB", (1440, 900), (245, 247, 250))
+            draw = ImageDraw.Draw(image)
+            blue = (20, 120, 235)
+            draw.rectangle((370, 100, 390, 120), fill=blue)
+            draw.rectangle((410, 101, 420, 119), fill=blue)
+            draw.rectangle((445, 101, 455, 119), fill=blue)
+            draw.rectangle((480, 101, 490, 119), fill=blue)
+            draw.rectangle((370, 500, 390, 520), fill=blue)
+            image.save(image_path)
+
+            inspector = ScreenInspector(Path(d) / "screenshots")
+            raw_points = inspector.find_selected_checkbox_ratios(image_path)
+            filtered = inspector.filter_source_checkbox_marker_points(image_path, raw_points)
+
+            self.assertEqual(len(filtered), 1)
+            self.assertAlmostEqual(filtered[0][1], 510 / 900, places=2)
+
     def test_checkbox_outline_detection_handles_picker_rows(self):
         with tempfile.TemporaryDirectory() as d:
             from PIL import Image, ImageDraw

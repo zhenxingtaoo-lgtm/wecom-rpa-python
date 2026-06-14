@@ -1237,9 +1237,14 @@ class ForwardFlow:
         return True
 
     def _source_selected_checkbox_ratios(self, image_path) -> list[tuple[float, float]]:
-        raw_points = self.screen.find_selected_checkbox_ratios(
+        raw_points = self.screen.filter_source_checkbox_marker_points(
             image_path,
-            scan_region_ratio=(0.18, 0.07, 0.32, 0.76),
+            list(
+                self.screen.find_selected_checkbox_ratios(
+                    image_path,
+                    scan_region_ratio=(0.18, 0.07, 0.32, 0.76),
+                )
+            ),
         )
         return self._select_source_checkbox_column(raw_points)
 
@@ -1289,7 +1294,10 @@ class ForwardFlow:
         if image_width <= 0 or image_height <= 0 or rect.width <= 0 or rect.height <= 0:
             return []
 
-        raw_points = list(self.screen.find_selected_checkbox_ratios(image_path))
+        raw_points = self.screen.filter_source_checkbox_marker_points(
+            image_path,
+            list(self.screen.find_selected_checkbox_ratios(image_path)),
+        )
 
         def convert_with_scale(scale: float) -> list[tuple[float, float]]:
             converted: list[tuple[float, float]] = []

@@ -198,9 +198,13 @@ def inspect_source_selection(config: AppConfig, screenshot_dir: Path, rect: Any)
 
     image_size = inspector.image_size(screenshot)
     converted_points = convert_fullscreen_checkbox_ratios_to_window(inspector, screenshot, rect, image_size)
+    fullscreen_raw_points = inspector.filter_source_checkbox_marker_points(
+        screenshot,
+        list(inspector.find_selected_checkbox_ratios(screenshot)),
+    )
     fullscreen_points = [
         (x_ratio, y_ratio)
-        for x_ratio, y_ratio in inspector.find_selected_checkbox_ratios(screenshot)
+        for x_ratio, y_ratio in fullscreen_raw_points
         if 0.18 <= x_ratio <= 0.50 and 0.08 <= y_ratio <= 0.82
     ]
     points = select_source_checkbox_column(converted_points)
@@ -286,7 +290,10 @@ def convert_fullscreen_checkbox_ratios_to_window(
         scales.add(image_width / rect.width)
     if image_height > rect.height * 1.25:
         scales.add(image_height / rect.height)
-    raw_points = list(inspector.find_selected_checkbox_ratios(image_path))
+    raw_points = inspector.filter_source_checkbox_marker_points(
+        image_path,
+        list(inspector.find_selected_checkbox_ratios(image_path)),
+    )
     seen: set[tuple[int, int]] = set()
     for scale in scales:
         scaled_left = rect.left * scale
@@ -651,7 +658,10 @@ class WeComRpaApp:
                 )
                 inspection = replace(
                     inspection,
-                    config=replace(inspection.config, source_selection=updated_source_selection),
+                    config=replace(
+                    inspection.config,
+                    source_selection=updated_source_selection,
+                    ),
                 )
                 self._check_log(
                     "源消息坐标已记录到本次运行配置："

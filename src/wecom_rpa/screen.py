@@ -575,6 +575,77 @@ $items | ConvertTo-Json -Compress
         )
         return points
 
+    def filter_source_checkbox_marker_points(
+        self,
+        image_path: str | Path,
+        points: list[tuple[float, float]],
+    ) -> list[tuple[float, float]]:
+        """Exclude the blue "选择到这里" marker from source-message checkbox candidates.
+
+        The marker's arrow is checkbox-sized and appears in the same left column as
+        message checkboxes, but it is followed by a dense run of blue label pixels.
+        Real selected-message checkboxes have an empty strip immediately to the right.
+        """
+        image = Path(image_path)
+        if not points or not image.exists() or image.suffix.lower() != ".png":
+            return points
+        try:
+            from PIL import Image  # type: ignore
+
+            with Image.open(image) as raw:
+                rgb = raw.convert("RGB")
+                width, height = rgb.size
+                pixels = rgb.load()
+                _min_size, max_size, _max_delta = self._checkbox_size_limits(width, height)
+                scale = max(width / 1440.0, height / 900.0, 1.0)
+                scan_offset = max(8, round(max_size * 0.65))
+                scan_width = max(round(95 * scale), max_size * 4)
+                scan_half_height = max(round(16 * scale), max_size)
+                min_blue_pixels = max(45, round(55 * scale * scale))
+                marker_seeds: list[tuple[float, float, int]] = []
+                for x_ratio, y_ratio in points:
+                    center_x = round(x_ratio * width)
+                    center_y = round(y_ratio * height)
+                    left = max(0, center_x + scan_offset)
+                    right = min(width, center_x + scan_width)
+                    top = max(0, center_y - scan_half_height)
+                    bottom = min(height, center_y + scan_half_height + 1)
+                    blue_pixels = 0
+                    for y in range(top, bottom):
+                        for x in range(left, right):
+                            if self._is_selected_checkbox_blue(*pixels[x, y]):
+                                blue_pixels += 1
+                    if blue_pixels >= min_blue_pixels:
+                        marker_seeds.append((x_ratio, y_ratio, blue_pixels))
+                if not marker_seeds:
+                    return points
+                filtered: list[tuple[float, float]] = []
+                rejected: list[tuple[float, float, int]] = []
+                for point_x, point_y in points:
+                    matching_seed = next(
+                        (
+                            seed
+                            for seed in marker_seeds
+                            if abs(point_y - seed[1]) <= 0.020
+                            and seed[0] - 0.012 <= point_x <= seed[0] + 0.075
+                        ),
+                        None,
+                    )
+                    if matching_seed is not None:
+                        rejected.append((point_x, point_y, matching_seed[2]))
+                    else:
+                        filtered.append((point_x, point_y))
+                if rejected:
+                    log.info(
+                        "已排除“选择到这里”蓝色标记候选：rejected=%s kept=%s",
+                        [(round(x, 3), round(y, 3), count) for x, y, count in rejected],
+                        [(round(x, 3), round(y, 3)) for x, y in filtered],
+                    )
+                return filtered
+        except Exception as exc:
+            log.warning("排除“选择到这里”蓝色标记失败，保留原候选：%s", exc)
+            return points
+
     def find_checkbox_outline_ratios(
         self,
         image_path: str | Path,
