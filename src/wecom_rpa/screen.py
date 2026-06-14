@@ -54,6 +54,54 @@ class OcrLine:
         return self.top + self.height // 2
 
 
+def select_aligned_checkbox_column(
+    points: list[tuple[float, float]],
+    *,
+    min_x: float,
+    max_x: float,
+    min_y: float,
+    max_y: float,
+    x_tolerance: float = 0.018,
+) -> list[tuple[float, float]]:
+    candidates = [
+        (x_ratio, y_ratio)
+        for x_ratio, y_ratio in points
+        if min_x <= x_ratio <= max_x and min_y <= y_ratio <= max_y
+    ]
+    if not candidates:
+        return []
+
+    clusters: list[list[tuple[float, float]]] = []
+    for point in sorted(candidates, key=lambda item: item[0]):
+        matching = next(
+            (
+                cluster
+                for cluster in clusters
+                if abs(point[0] - sum(x for x, _y in cluster) / len(cluster)) <= x_tolerance
+            ),
+            None,
+        )
+        if matching is None:
+            clusters.append([point])
+        else:
+            matching.append(point)
+
+    source_cluster = max(
+        clusters,
+        key=lambda cluster: (
+            len({round(y, 3) for _x, y in cluster}),
+            len(cluster),
+            -sum(x for x, _y in cluster) / len(cluster),
+        ),
+    )
+    deduped: list[tuple[float, float]] = []
+    for point in sorted(source_cluster, key=lambda item: item[1]):
+        if any(abs(point[1] - existing[1]) <= 0.012 for existing in deduped):
+            continue
+        deduped.append(point)
+    return deduped
+
+
 class ScreenInspector:
     """截图 / 模板匹配 / OCR 封装。
 
@@ -501,7 +549,10 @@ $items | ConvertTo-Json -Compress
                 time.monotonic() - started,
             )
             return cv_points
-        points = self._find_selected_checkbox_ratios_via_pillow(image)
+        points = self._find_selected_checkbox_ratios_via_pillow(
+            image,
+            scan_region_ratio=scan_region_ratio,
+        )
         if points:
             log.info(
                 "蓝色复选框识别完成：backend=pillow image=%s points=%s elapsed=%.3fs",
@@ -560,8 +611,13 @@ $items | ConvertTo-Json -Compress
                 max_size = max(42, int(36 * scale))
                 max_delta = max(10, int(8 * scale))
                 points: list[tuple[float, float]] = []
-                for y in range(0, height):
-                    for x in range(0, width):
+                start_x, start_y, end_x, end_y = self._scan_pixel_bounds(
+                    width,
+                    height,
+                    scan_region_ratio,
+                )
+                for y in range(start_y, end_y):
+                    for x in range(start_x, end_x):
                         if (x, y) in visited:
                             continue
                         r, g, b = pixels[x, y]
@@ -581,7 +637,13 @@ $items | ConvertTo-Json -Compress
                             min_y = min(min_y, py)
                             max_y = max(max_y, py)
                             for nx, ny in ((px + 1, py), (px - 1, py), (px, py + 1), (px, py - 1)):
-                                if nx < 0 or ny < 0 or nx >= width or ny >= height or (nx, ny) in visited:
+                                if (
+                                    nx < start_x
+                                    or ny < start_y
+                                    or nx >= end_x
+                                    or ny >= end_y
+                                    or (nx, ny) in visited
+                                ):
                                     continue
                                 nr, ng, nb = pixels[nx, ny]
                                 if self._is_checkbox_outline_gray(nr, ng, nb):
@@ -705,7 +767,27 @@ $items | ConvertTo-Json -Compress
             log.debug("OpenCV 复选框连通域识别失败，回退像素扫描：%s", exc)
             return None
 
-    def _find_selected_checkbox_ratios_via_pillow(self, image_path: Path) -> list[tuple[float, float]]:
+    def _scan_pixel_bounds(
+        self,
+        width: int,
+        height: int,
+        scan_region_ratio: tuple[float, float, float, float] | None,
+    ) -> tuple[int, int, int, int]:
+        if scan_region_ratio is None:
+            return (0, 0, width, height)
+        x_ratio, y_ratio, width_ratio, height_ratio = scan_region_ratio
+        left = max(0, min(width - 1, round(width * x_ratio)))
+        top = max(0, min(height - 1, round(height * y_ratio)))
+        right = max(left + 1, min(width, round(width * (x_ratio + width_ratio))))
+        bottom = max(top + 1, min(height, round(height * (y_ratio + height_ratio))))
+        return (left, top, right, bottom)
+
+    def _find_selected_checkbox_ratios_via_pillow(
+        self,
+        image_path: Path,
+        *,
+        scan_region_ratio: tuple[float, float, float, float] | None = None,
+    ) -> list[tuple[float, float]]:
         try:
             from PIL import Image  # type: ignore
         except Exception as exc:
@@ -719,10 +801,16 @@ $items | ConvertTo-Json -Compress
                 visited: set[tuple[int, int]] = set()
                 min_size, max_size, max_delta = self._checkbox_size_limits(width, height)
                 points: list[tuple[float, float]] = []
-                start_y = int(height * 0.05)
-                start_x = int(width * 0.02)
-                end_x = int(width * 0.95)
-                for y in range(start_y, height):
+                start_x, start_y, end_x, end_y = self._scan_pixel_bounds(
+                    width,
+                    height,
+                    scan_region_ratio,
+                )
+                if scan_region_ratio is None:
+                    start_y = max(start_y, int(height * 0.05))
+                    start_x = max(start_x, int(width * 0.02))
+                    end_x = min(end_x, int(width * 0.95))
+                for y in range(start_y, end_y):
                     for x in range(start_x, end_x):
                         if (x, y) in visited:
                             continue
@@ -743,7 +831,13 @@ $items | ConvertTo-Json -Compress
                             min_y = min(min_y, py)
                             max_y = max(max_y, py)
                             for nx, ny in ((px + 1, py), (px - 1, py), (px, py + 1), (px, py - 1)):
-                                if nx < 0 or ny < 0 or nx >= width or ny >= height or (nx, ny) in visited:
+                                if (
+                                    nx < start_x
+                                    or ny < start_y
+                                    or nx >= end_x
+                                    or ny >= end_y
+                                    or (nx, ny) in visited
+                                ):
                                     continue
                                 nr, ng, nb = pixels[nx, ny]
                                 visited.add((nx, ny))

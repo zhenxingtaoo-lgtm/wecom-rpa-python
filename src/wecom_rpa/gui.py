@@ -16,7 +16,7 @@ from .config import AppConfig, load_config
 from .forward_flow import FlowResult, ForwardFlow
 from .powershell import terminate_active_powershell
 from .safety import StopController
-from .screen import ScreenInspector
+from .screen import ScreenInspector, select_aligned_checkbox_column
 from .wecom_window import WeComWindow
 
 log = logging.getLogger(__name__)
@@ -210,7 +210,7 @@ def inspect_source_selection(config: AppConfig, screenshot_dir: Path, rect: Any)
     fullscreen_points = [
         (x_ratio, y_ratio)
         for x_ratio, y_ratio in inspector.find_selected_checkbox_ratios(screenshot)
-        if 0.18 <= x_ratio <= 0.50 and 0.04 <= y_ratio <= 0.90
+        if 0.18 <= x_ratio <= 0.50 and 0.08 <= y_ratio <= 0.82
     ]
     points = select_source_checkbox_column(converted_points)
     fullscreen_source_points = select_source_checkbox_column(fullscreen_points)
@@ -233,33 +233,14 @@ def select_source_checkbox_column(
     *,
     x_tolerance: float = 0.018,
 ) -> list[tuple[float, float]]:
-    candidates = [
-        (x_ratio, y_ratio)
-        for x_ratio, y_ratio in points
-        if 0.18 <= x_ratio <= 0.50 and 0.04 <= y_ratio <= 0.90
-    ]
-    if not candidates:
-        return []
-
-    clusters: list[list[tuple[float, float]]] = []
-    for point in sorted(candidates, key=lambda item: item[0]):
-        matching = next(
-            (
-                cluster
-                for cluster in clusters
-                if abs(point[0] - sum(x for x, _y in cluster) / len(cluster)) <= x_tolerance
-            ),
-            None,
-        )
-        if matching is None:
-            clusters.append([point])
-        else:
-            matching.append(point)
-    source_cluster = max(
-        clusters,
-        key=lambda cluster: (len(cluster), -sum(x for x, _y in cluster) / len(cluster)),
+    return select_aligned_checkbox_column(
+        points,
+        min_x=0.18,
+        max_x=0.50,
+        min_y=0.08,
+        max_y=0.82,
+        x_tolerance=x_tolerance,
     )
-    return sorted(source_cluster, key=lambda item: item[1])
 
 
 def detect_forward_button_ratio(inspector: ScreenInspector, image_path: Path, rect: Any) -> tuple[float, float] | None:
@@ -328,7 +309,7 @@ def convert_fullscreen_checkbox_ratios_to_window(
                 continue
             local_x = (abs_x - scaled_left) / scaled_width
             local_y = (abs_y - scaled_top) / scaled_height
-            if 0.18 <= local_x <= 0.50 and 0.04 <= local_y <= 0.90:
+            if 0.18 <= local_x <= 0.50 and 0.08 <= local_y <= 0.82:
                 key = (round(local_x * 10000), round(local_y * 10000))
                 if key in seen:
                     continue

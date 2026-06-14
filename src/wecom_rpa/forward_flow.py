@@ -8,7 +8,7 @@ from typing import Any, Callable
 
 from .config import AppConfig
 from .safety import StopController, assert_batch_selection_count
-from .screen import Region, ScreenInspector
+from .screen import Region, ScreenInspector, select_aligned_checkbox_column
 from .wecom_window import WeComWindow, WindowRect
 
 log = logging.getLogger(__name__)
@@ -1076,17 +1076,29 @@ class ForwardFlow:
 
     def _record_exact_source_selection(self, image_path, rect: WindowRect | None = None) -> None:
         selected_points = self._source_selected_checkbox_ratios_in_window(image_path, rect) if rect is not None else self._source_selected_checkbox_ratios(image_path)
-        if not selected_points and rect is not None:
-            selected_points = self._source_selected_checkbox_ratios_from_fullscreen(rect, "source_fullscreen_probe")
-            if selected_points:
+        expected_count = len(self.source_checkbox_y_ratios)
+        if len(selected_points) != expected_count and rect is not None:
+            fallback_points = self._source_selected_checkbox_ratios_from_fullscreen(rect, "source_fullscreen_probe")
+            if fallback_points:
                 log.info(
-                    "窗口裁剪图未检测到源消息蓝勾，已通过全屏截图 fallback 获得 %s 个",
+                    "窗口截图源消息数量与检查记录不一致，已使用 DPI-aware 全屏截图复核："
+                    "expected=%s crop=%s fullscreen=%s",
+                    expected_count,
                     len(selected_points),
+                    len(fallback_points),
                 )
-        if not selected_points:
-            log.warning("未检测到任何源消息蓝色勾选框，请确认已手动勾选待转发消息")
+                selected_points = fallback_points
+        if len(selected_points) != expected_count:
+            log.warning(
+                "源消息数量与检查阶段记录不一致：expected=%s actual=%s points=%s",
+                expected_count,
+                len(selected_points),
+                [(round(x, 3), round(y, 3)) for x, y in selected_points],
+            )
             if self.real_send_allowed:
-                raise RuntimeError("未检测到源消息蓝色勾选框，已停止以避免误发")
+                raise RuntimeError(
+                    f"真实发送前源消息蓝色勾选框数量不是检查阶段记录的 {expected_count} 个，已停止以避免误发"
+                )
             return
         source_points = sorted(selected_points, key=lambda item: item[1], reverse=True)
         self.source_checkbox_x_ratio = sum(x for x, _ in source_points) / len(source_points)
@@ -1148,14 +1160,23 @@ class ForwardFlow:
         return True
 
     def _source_selected_checkbox_ratios(self, image_path) -> list[tuple[float, float]]:
-        return [
-            (x_ratio, y_ratio)
-            for x_ratio, y_ratio in self.screen.find_selected_checkbox_ratios(
-                image_path,
-                scan_region_ratio=(0.18, 0.04, 0.32, 0.88),
-            )
-            if 0.18 <= x_ratio <= 0.50 and 0.04 <= y_ratio <= 0.92
-        ]
+        raw_points = self.screen.find_selected_checkbox_ratios(
+            image_path,
+            scan_region_ratio=(0.18, 0.07, 0.32, 0.76),
+        )
+        return self._select_source_checkbox_column(raw_points)
+
+    def _select_source_checkbox_column(
+        self,
+        points: list[tuple[float, float]],
+    ) -> list[tuple[float, float]]:
+        return select_aligned_checkbox_column(
+            points,
+            min_x=0.18,
+            max_x=0.50,
+            min_y=0.08,
+            max_y=0.82,
+        )
 
     def _source_selected_checkbox_ratios_in_window(self, image_path, rect: WindowRect | None) -> list[tuple[float, float]]:
         if rect is None:
@@ -1206,9 +1227,9 @@ class ForwardFlow:
                     continue
                 local_x = (abs_x - scaled_left) / scaled_width
                 local_y = (abs_y - scaled_top) / scaled_height
-                if 0.18 <= local_x <= 0.50 and 0.04 <= local_y <= 0.92:
+                if 0.18 <= local_x <= 0.50 and 0.08 <= local_y <= 0.82:
                     converted.append((local_x, local_y))
-            return converted
+            return self._select_source_checkbox_column(converted)
 
         primary = convert_with_scale(1.0)
         if primary:

@@ -1,6 +1,7 @@
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from PIL import Image, ImageDraw
 
@@ -117,6 +118,67 @@ class ForwardFlowTest(unittest.TestCase):
             candidates,
             [(0.117, 0.75, 0.117), (0.527, 0.75, 0.527), (0.708, 0.75, 0.708)],
         )
+
+    def test_source_checkbox_detection_excludes_title_and_toolbar_blue_items(self):
+        flow = ForwardFlow(AppConfig(), install_stop_hotkey=False)
+
+        selected = flow._select_source_checkbox_column(
+            [
+                (0.300, 0.043),
+                (0.263, 0.126),
+                (0.263, 0.307),
+                (0.263, 0.527),
+                (0.263, 0.708),
+                (0.271, 0.824),
+                (0.285, 0.825),
+                (0.312, 0.825),
+                (0.320, 0.826),
+            ]
+        )
+
+        self.assertEqual(
+            selected,
+            [(0.263, 0.126), (0.263, 0.307), (0.263, 0.527), (0.263, 0.708)],
+        )
+
+    def test_reselect_source_messages_clicks_remaining_recorded_rows(self):
+        flow = ForwardFlow(AppConfig(), install_stop_hotkey=False)
+        flow.source_checkbox_x_ratio = 0.263
+        flow.source_checkbox_y_ratios = [0.708, 0.527, 0.307, 0.126]
+        flow.window.click_screen = mock.Mock(return_value=True)
+        flow.screen.save_checkpoint = mock.Mock(return_value=Path("probe.png"))
+        flow._enter_multiselect_from_source = mock.Mock(return_value=0.126)
+        flow._verify_source_messages_selected = mock.Mock(return_value=True)
+        rect = WindowRect(0, 0, 2000, 1000)
+
+        flow._reselect_source_messages(rect)
+
+        self.assertEqual(
+            [call.args for call in flow.window.click_screen.call_args_list],
+            [
+                rect.relative_point(0.263, 0.708),
+                rect.relative_point(0.263, 0.527),
+                rect.relative_point(0.263, 0.307),
+            ],
+        )
+
+    def test_record_exact_source_selection_rejects_changed_count(self):
+        flow = ForwardFlow(
+            AppConfig(),
+            real_send_allowed=True,
+            install_stop_hotkey=False,
+        )
+        flow.source_checkbox_y_ratios = [0.708, 0.527, 0.307, 0.126]
+        flow._source_selected_checkbox_ratios_in_window = mock.Mock(
+            return_value=[(0.263, 0.708), (0.263, 0.527), (0.263, 0.307)]
+        )
+        flow._source_selected_checkbox_ratios_from_fullscreen = mock.Mock(return_value=[])
+
+        with self.assertRaisesRegex(RuntimeError, "检查阶段记录的 4 个"):
+            flow._record_exact_source_selection(
+                Path("probe.png"),
+                rect=WindowRect(0, 0, 2000, 1000),
+            )
 
     def test_source_context_menu_region_is_local_to_click(self):
         flow = ForwardFlow(AppConfig(), install_stop_hotkey=False)
