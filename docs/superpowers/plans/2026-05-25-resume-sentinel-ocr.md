@@ -1,5 +1,7 @@
 # Resume, Sentinel, and OCR Hardening Implementation Plan
 
+> **Archived:** This plan describes the removed CSV, SQLite, and resume workflow. It is retained only as history. See `README.md` and `docs/DESIGN.md` for the current implementation.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make real-send runs resumable while preventing boundary over-send when OCR or sentinel trimming is uncertain.

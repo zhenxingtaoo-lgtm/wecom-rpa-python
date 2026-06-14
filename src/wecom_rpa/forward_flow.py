@@ -434,15 +434,30 @@ class ForwardFlow:
 
         started = time.monotonic()
         log.info("开始等待发送给弹窗出现：batch=%s", batch_no)
-        self._sleep(1.0)
-        picker_shot = self.screen.save_checkpoint(
-            f"batch_{batch_no}_recipient_picker_opened",
-            region=self._recipient_picker_title_region(rect),
-        )
-        if self._has_ocr_text(picker_shot, ("发送给", "分别发送给")):
-            elapsed = time.monotonic() - started
-            log.info("发送给弹窗识别完成：batch=%s screenshot=%s elapsed=%.2fs", batch_no, picker_shot, elapsed)
-            return
+        picker_shot = None
+        for attempt in range(1, 4):
+            self._sleep(0.20 if attempt == 1 else 0.15)
+            picker_shot = self.screen.save_checkpoint(
+                f"batch_{batch_no}_recipient_picker_opened_attempt_{attempt}",
+                region=self._recipient_picker_title_region(rect),
+            )
+            if self._has_ocr_text(picker_shot, ("发送给", "分别发送给")):
+                elapsed = time.monotonic() - started
+                log.info(
+                    "发送给弹窗识别完成：batch=%s attempt=%s screenshot=%s elapsed=%.2fs",
+                    batch_no,
+                    attempt,
+                    picker_shot,
+                    elapsed,
+                )
+                return
+            log.info(
+                "发送给弹窗尚未识别到：batch=%s attempt=%s screenshot=%s elapsed=%.2fs",
+                batch_no,
+                attempt,
+                picker_shot,
+                time.monotonic() - started,
+            )
         elapsed = time.monotonic() - started
         log.error("发送给弹窗识别失败：batch=%s screenshot=%s elapsed=%.2fs", batch_no, picker_shot, elapsed)
         raise RuntimeError(f"点击逐条转发后未识别到发送给弹窗，已停止以避免误点会话列表。screenshot={picker_shot}")
@@ -478,49 +493,116 @@ class ForwardFlow:
             return (0.494, 0.810)
         return (0.492, 0.820)
 
+    def _recipient_scrollbar_drag_candidates(
+        self,
+        rect: WindowRect,
+    ) -> list[tuple[tuple[int, int], tuple[int, int]]]:
+        if rect.width >= 1600:
+            x_ratio, start_y_ratios, end_y_ratio = (0.494, (0.340, 0.360, 0.380), 0.810)
+        else:
+            x_ratio, start_y_ratios, end_y_ratio = (0.492, (0.335, 0.360, 0.385), 0.820)
+        end = rect.relative_point(x_ratio, end_y_ratio)
+        return [(rect.relative_point(x_ratio, start_y), end) for start_y in start_y_ratios]
+
+    def _recipient_list_compare_region(self, rect: WindowRect) -> Region:
+        return Region(
+            left=rect.left + round(rect.width * 0.285),
+            top=rect.top + round(rect.height * 0.325),
+            width=round(rect.width * 0.200),
+            height=round(rect.height * 0.510),
+        )
+
+    def _save_recipient_list_checkpoint(self, name: str, rect: WindowRect) -> Path:
+        self._activate_window_for_capture()
+        return self.screen.save_checkpoint(name, region=self._recipient_list_compare_region(rect))
+
     def _scroll_recipient_picker_to_bottom(self, rect: WindowRect, batch_no: int) -> None:
-        """点击会话列表滚动条下方轨道，直到列表画面连续两轮保持稳定。"""
+        """拖动会话列表滚动条到底部，并通过稳定画面确认位置。"""
         click_x_ratio, click_y_ratio = self._recipient_scrollbar_track_point(rect)
         click_x, click_y = rect.relative_point(click_x_ratio, click_y_ratio)
         configured_repeats = self.config.recipient_selection.scroll_to_bottom_repeats
-        max_rounds = max(3, configured_repeats)
-        clicks_per_round = 2
-        previous_path = self._save_window_checkpoint(f"batch_{batch_no}_recipient_scroll_before", rect)
+        max_fallback_rounds = min(3, max(1, configured_repeats))
+        drag_candidates = self._recipient_scrollbar_drag_candidates(rect)
+        previous_path = self._save_recipient_list_checkpoint(
+            f"batch_{batch_no}_recipient_scroll_before",
+            rect,
+        )
         stable_rounds = 0
         moved = False
 
         log.info(
-            "开始滚动收件人列表：batch=%s method=scrollbar_track "
-            "ratio=(%.3f, %.3f) abs=(%s, %s) max_rounds=%s clicks_per_round=%s",
+            "开始滚动收件人列表：batch=%s method=scrollbar_drag "
+            "drag_candidates=%s verify_track=(%s, %s) max_verify_rounds=%s",
             batch_no,
-            click_x_ratio,
-            click_y_ratio,
+            drag_candidates,
             click_x,
             click_y,
-            max_rounds,
-            clicks_per_round,
+            max_fallback_rounds,
         )
-        for round_no in range(1, max_rounds + 1):
-            for click_no in range(1, clicks_per_round + 1):
-                log.info(
-                    "点击收件人列表滚动条轨道：batch=%s round=%s click=%s "
-                    "ratio=(%.3f, %.3f) abs=(%s, %s)",
-                    batch_no,
-                    round_no,
-                    click_no,
-                    click_x_ratio,
-                    click_y_ratio,
-                    click_x,
-                    click_y,
-                )
-                if not self.window.click_screen(click_x, click_y):
-                    raise RuntimeError(
-                        f"无法点击收件人列表滚动条轨道：batch={batch_no} "
-                        f"abs=({click_x}, {click_y})"
-                    )
-                self._sleep(0.15)
+        drag_screen = getattr(self.window, "drag_screen", None)
+        if not callable(drag_screen):
+            raise RuntimeError("当前环境不支持拖动收件人列表滚动条，已停止避免未到底就选择会话")
 
-            current_path = self._save_window_checkpoint(
+        for attempt, (drag_start, drag_end) in enumerate(drag_candidates, start=1):
+            log.info(
+                "尝试拖动收件人滚动条：batch=%s attempt=%s start=%s end=%s",
+                batch_no,
+                attempt,
+                drag_start,
+                drag_end,
+            )
+            if not drag_screen(*drag_start, *drag_end, duration=0.40):
+                log.warning("拖动收件人滚动条操作失败：batch=%s attempt=%s", batch_no, attempt)
+                continue
+            self._sleep(0.20)
+            dragged_path = self._save_recipient_list_checkpoint(
+                f"batch_{batch_no}_recipient_scroll_after_drag_{attempt}",
+                rect,
+            )
+            difference = self._recipient_list_image_difference(previous_path, dragged_path)
+            if difference is None:
+                raise RuntimeError(
+                    "无法比较拖动滚动条前后的截图，不能确认滚动操作是否生效。"
+                    f"before={previous_path} after={dragged_path}"
+                )
+            moved = difference >= 1.5
+            log.info(
+                "收件人滚动条拖动结果：batch=%s attempt=%s difference=%.3f moved=%s screenshot=%s",
+                batch_no,
+                attempt,
+                difference,
+                moved,
+                dragged_path,
+            )
+            previous_path = dragged_path
+            if moved:
+                break
+
+        if not moved:
+            raise RuntimeError(
+                "未能拖动收件人列表滚动条，列表没有发生移动，已停止避免从非底部选择会话。"
+                f"batch={batch_no} candidates={drag_candidates} screenshot={previous_path}"
+            )
+
+        verification_rounds = max_fallback_rounds + 2
+        for round_no in range(1, verification_rounds + 1):
+            log.info(
+                "点击收件人列表滚动条底部轨道进行到底复核：batch=%s round=%s "
+                "ratio=(%.3f, %.3f) abs=(%s, %s)",
+                batch_no,
+                round_no,
+                click_x_ratio,
+                click_y_ratio,
+                click_x,
+                click_y,
+            )
+            if not self.window.click_screen(click_x, click_y):
+                raise RuntimeError(
+                    f"无法点击收件人列表滚动条轨道：batch={batch_no} "
+                    f"abs=({click_x}, {click_y})"
+                )
+            self._sleep(0.12)
+            current_path = self._save_recipient_list_checkpoint(
                 f"batch_{batch_no}_recipient_scroll_round_{round_no}",
                 rect,
             )
@@ -548,7 +630,7 @@ class ForwardFlow:
             previous_path = current_path
             if moved and stable_rounds >= 2:
                 log.info(
-                    "收件人列表已确认滚动到底部：batch=%s moved=%s rounds=%s screenshot=%s",
+                    "收件人列表已确认滚动到底部：batch=%s method=drag_then_verify moved=%s rounds=%s screenshot=%s",
                     batch_no,
                     moved,
                     round_no,
@@ -563,7 +645,7 @@ class ForwardFlow:
             )
         raise RuntimeError(
             "收件人列表在限定次数内未出现连续稳定画面，无法确认已经滚动到底部，已停止避免误选。"
-            f"batch={batch_no} rounds={max_rounds} last_screenshot={previous_path}"
+            f"batch={batch_no} rounds={verification_rounds} last_screenshot={previous_path}"
         )
 
     def _recipient_list_image_difference(self, before_path: Path, after_path: Path) -> float | None:
@@ -573,12 +655,7 @@ class ForwardFlow:
             with Image.open(before_path) as before_image, Image.open(after_path) as after_image:
                 width = min(before_image.width, after_image.width)
                 height = min(before_image.height, after_image.height)
-                box = (
-                    int(width * 0.285),
-                    int(height * 0.325),
-                    int(width * 0.485),
-                    int(height * 0.835),
-                )
+                box = (0, 0, width, height)
                 before_crop = before_image.convert("L").crop(box).resize((96, 160))
                 after_crop = after_image.convert("L").crop(box).resize((96, 160))
                 return float(ImageStat.Stat(ImageChops.difference(before_crop, after_crop)).mean[0])

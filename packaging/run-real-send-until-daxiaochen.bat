@@ -1,10 +1,10 @@
 @echo off
 setlocal
 set "ROOT=%~dp0"
-if not exist "%ROOT%config\real_send_until_daxiaochen.yaml" if exist "%ROOT%..\config\real_send_until_daxiaochen.yaml" set "ROOT=%ROOT%..\"
+if not exist "%ROOT%app\wecom-rpa.exe" if exist "%ROOT%..\app\wecom-rpa.exe" set "ROOT=%ROOT%..\"
 cd /d "%ROOT%"
-if not exist "config\real_send_until_daxiaochen.yaml" (
-  echo Cannot find config\real_send_until_daxiaochen.yaml.
+if not exist "app\wecom-rpa.exe" (
+  echo Cannot find app\wecom-rpa.exe.
   echo Please unzip and run this script from the complete WeComRPA package directory.
   echo Current directory: %CD%
   pause
@@ -12,7 +12,7 @@ if not exist "config\real_send_until_daxiaochen.yaml" (
 )
 
 echo This will really operate WeCom and send selected messages.
-echo Confirm that WeCom is open, source messages are selected, and config is calibrated.
+echo Confirm that WeCom is open and source messages are selected.
 set /p CONFIRM=Type SEND to continue: 
 if /I not "%CONFIRM%"=="SEND" (
   echo Cancelled.
@@ -27,8 +27,9 @@ if "%SEND_COUNT%"=="" (
 )
 
 app\wecom-rpa.exe ^
-  --config config\real_send_until_daxiaochen.yaml ^
   --send-count %SEND_COUNT% ^
+  --batch-size 9 ^
+  --sentinel-name 大小尘 ^
   --log-file logs\wecom_rpa.log ^
   --screenshot-dir screenshots\real_send ^
   --yes ^

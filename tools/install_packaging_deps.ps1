@@ -20,7 +20,6 @@ try {
   & $VenvPython -m pip install --upgrade pip setuptools wheel -i $IndexUrl
   & $VenvPython -m pip install -i $IndexUrl `
     PyInstaller `
-    PyYAML `
     Pillow `
     numpy==1.26.4 `
     opencv-python==4.6.0.66 `
@@ -49,7 +48,6 @@ try {
 import importlib
 
 modules = [
-    "yaml",
     "PIL",
     "numpy",
     "cv2",

@@ -30,9 +30,9 @@ PYTHONPATH=src python -m wecom_rpa.calibration probe --crop-suggestions || true
 
 echo "[4/4] 启动 dry-run：模拟处理测试群，不会真实发送"
 python -m wecom_rpa.main \
-  --config config/config.example.yaml \
-  --groups data/test_groups_1_9.csv \
-  --db data/wecom_rpa.sqlite3 \
+  --send-count 9 \
+  --batch-size 9 \
+  --yes \
   --dry-run
 
 echo

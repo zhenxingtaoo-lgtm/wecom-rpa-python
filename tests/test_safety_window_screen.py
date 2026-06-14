@@ -186,6 +186,27 @@ class SafetyWindowScreenTest(unittest.TestCase):
             self.assertTrue(window.click_screen(100, 200))
         powershell_click.assert_not_called()
 
+    def test_drag_uses_pyautogui(self):
+        window = WeComWindow("企业微信")
+        fake_position = mock.Mock(x=30, y=40)
+        fake_pyautogui = mock.Mock()
+        fake_pyautogui.position.return_value = fake_position
+
+        with mock.patch.object(window, "_ensure_foreground", return_value=True), mock.patch.dict(
+            "sys.modules", {"pyautogui": fake_pyautogui}
+        ):
+            self.assertTrue(window.drag_screen(10, 20, 30, 40, duration=0.25))
+
+        self.assertEqual(
+            fake_pyautogui.moveTo.call_args_list,
+            [
+                mock.call(10, 20, duration=0.08),
+                mock.call(30, 40, duration=0.25),
+            ],
+        )
+        fake_pyautogui.mouseDown.assert_called_once_with(button="left")
+        fake_pyautogui.mouseUp.assert_called_once_with(button="left")
+
     def test_powershell_exe_does_not_fallback_to_wsl_mount(self):
         with mock.patch.object(powershell.shutil, "which", return_value=None), mock.patch.object(
             powershell.Path, "exists", side_effect=AssertionError("/mnt/c fallback should not be checked")
@@ -211,10 +232,26 @@ class SafetyWindowScreenTest(unittest.TestCase):
             ],
         )
 
-    def test_paddleocr_empty_result_falls_back_to_windows(self):
+    def test_paddleocr_empty_result_does_not_fall_back_to_windows(self):
         inspector = ScreenInspector("screenshots", ocr_engine="paddleocr", ocr_fallback="windows")
         calls = []
         inspector._ocr_lines_via_paddleocr = lambda _image: []  # type: ignore[method-assign]
+        inspector._ocr_lines_via_windows_ocr = lambda _image: calls.append("windows") or [OcrLine("fallback", 1, 2, 3, 4)]  # type: ignore[method-assign]
+
+        lines = inspector.ocr_lines(image_path=Path("fake.png"))
+
+        self.assertEqual(calls, [])
+        self.assertEqual(lines, [])
+
+    def test_paddleocr_failure_can_fall_back_to_windows(self):
+        inspector = ScreenInspector("screenshots", ocr_engine="paddleocr", ocr_fallback="windows")
+        calls = []
+
+        def fail_paddle(_image):
+            inspector._last_paddle_ocr_failed = True
+            return []
+
+        inspector._ocr_lines_via_paddleocr = fail_paddle  # type: ignore[method-assign]
         inspector._ocr_lines_via_windows_ocr = lambda _image: calls.append("windows") or [OcrLine("fallback", 1, 2, 3, 4)]  # type: ignore[method-assign]
 
         lines = inspector.ocr_lines(image_path=Path("fake.png"))

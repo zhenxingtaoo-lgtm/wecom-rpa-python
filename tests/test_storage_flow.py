@@ -108,6 +108,27 @@ class ForwardFlowTest(unittest.TestCase):
             self.assertGreater(flow._recipient_list_image_difference(before_path, moved_path), 1.5)
             self.assertLess(flow._recipient_list_image_difference(moved_path, stable_path), 1.5)
 
+    def test_recipient_list_compare_region_is_smaller_than_window(self):
+        flow = ForwardFlow(AppConfig(), install_stop_hotkey=False)
+        rect = WindowRect(-4, -4, 2888, 1712)
+
+        region = flow._recipient_list_compare_region(rect)
+
+        self.assertLess(region.width, rect.width // 3)
+        self.assertLess(region.height, rect.height)
+
+    def test_recipient_scrollbar_drag_spans_track(self):
+        flow = ForwardFlow(AppConfig(), install_stop_hotkey=False)
+        rect = WindowRect(-4, -4, 2888, 1712)
+
+        candidates = flow._recipient_scrollbar_drag_candidates(rect)
+
+        self.assertEqual(len(candidates), 3)
+        for start, end in candidates:
+            self.assertEqual(start[0], end[0])
+            self.assertGreater(end[1] - start[1], rect.height // 3)
+            self.assertGreater(start[1], rect.top + rect.height * 0.30)
+
     def test_source_context_menu_candidates_use_same_message_rows(self):
         flow = ForwardFlow(AppConfig(), install_stop_hotkey=False)
         flow.source_checkbox_y_ratios = [0.708, 0.527, 0.117]

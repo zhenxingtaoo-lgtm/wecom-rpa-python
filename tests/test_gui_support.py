@@ -44,14 +44,16 @@ class GuiSupportTest(unittest.TestCase):
         self.assertLessEqual(layout.width, 1400)
         self.assertLessEqual(layout.height, 820)
 
+    def test_elapsed_time_is_formatted_in_chinese(self):
+        self.assertEqual(WeComRpaApp._format_elapsed(8.4), "8秒")
+        self.assertEqual(WeComRpaApp._format_elapsed(65), "1分5秒")
+        self.assertEqual(WeComRpaApp._format_elapsed(3661), "1小时1分1秒")
+
     def test_inspection_uses_gui_send_count_and_batch_overrides(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
-            config_path = root / "config.yaml"
-            config_path.write_text("batch_size: 9\nbatch_interval_sec: 5\ndry_run: true\n", encoding="utf-8")
             inspection = inspect_run_setup(
                 GuiRunOptions(
-                    config_path=config_path,
                     log_file=root / "logs" / "wecom_rpa.log",
                     screenshot_dir=root / "screenshots",
                     send_count=20,
@@ -68,12 +70,9 @@ class GuiSupportTest(unittest.TestCase):
     def test_inspection_rejects_non_positive_send_count(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
-            config_path = root / "config.yaml"
-            config_path.write_text("batch_size: 9\ndry_run: true\n", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "发送数量"):
                 inspect_run_setup(
                     GuiRunOptions(
-                        config_path=config_path,
                         log_file=root / "run.log",
                         screenshot_dir=root / "screenshots",
                         send_count=0,
@@ -83,10 +82,7 @@ class GuiSupportTest(unittest.TestCase):
     def test_run_snapshot_records_effective_parameters(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
-            config_path = root / "config.yaml"
-            config_path.write_text("batch_size: 9\ndry_run: true\n", encoding="utf-8")
             options = GuiRunOptions(
-                config_path=config_path,
                 log_file=root / "logs" / "wecom_rpa.log",
                 screenshot_dir=root / "screenshots",
                 send_count=12,
@@ -97,6 +93,24 @@ class GuiSupportTest(unittest.TestCase):
             self.assertEqual(payload["send_count"], 12)
             self.assertEqual(payload["batch_count"], 2)
             self.assertEqual(payload["effective_config"]["batch_size"], 9)
+            self.assertNotIn("config_path", payload)
+
+    def test_inspection_uses_gui_sentinel_parameters(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            inspection = inspect_run_setup(
+                GuiRunOptions(
+                    log_file=root / "run.log",
+                    screenshot_dir=root / "screenshots",
+                    send_count=10,
+                    sentinel_enabled=True,
+                    sentinel_names=("大小尘",),
+                )
+            )
+
+            sentinel = inspection.config.recipient_selection.sentinel
+            self.assertTrue(sentinel.enabled)
+            self.assertEqual(sentinel.names, ["大小尘"])
 
     def test_source_checkbox_column_uses_all_detected_message_rows(self):
         points = [

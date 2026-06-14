@@ -1,10 +1,10 @@
 @echo off
 setlocal
 set "ROOT=%~dp0"
-if not exist "%ROOT%config\config.example.yaml" if exist "%ROOT%..\config\config.example.yaml" set "ROOT=%ROOT%..\"
+if not exist "%ROOT%app\wecom-rpa.exe" if exist "%ROOT%..\app\wecom-rpa.exe" set "ROOT=%ROOT%..\"
 cd /d "%ROOT%"
-if not exist "config\config.example.yaml" (
-  echo Cannot find config\config.example.yaml.
+if not exist "app\wecom-rpa.exe" (
+  echo Cannot find app\wecom-rpa.exe.
   echo Please unzip and run this script from the complete WeComRPA package directory.
   echo Current directory: %CD%
   pause
@@ -12,7 +12,6 @@ if not exist "config\config.example.yaml" (
 )
 
 app\wecom-rpa.exe ^
-  --config config\config.example.yaml ^
   --log-file logs\ocr_check.log ^
   --screenshot-dir screenshots\ocr_check ^
   --check-ocr-models

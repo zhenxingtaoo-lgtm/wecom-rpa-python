@@ -129,6 +129,7 @@ class ScreenInspector:
         self.ocr_fallback = ocr_fallback
         self.paddle_model_root = Path(paddle_model_root) if paddle_model_root else None
         self._paddle_ocr = None
+        self._last_paddle_ocr_failed = False
         (self.screenshot_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
         (self.screenshot_dir / "errors").mkdir(parents=True, exist_ok=True)
 
@@ -268,8 +269,9 @@ class ScreenInspector:
             )
             return lines
         if self.ocr_engine == "paddleocr":
+            self._last_paddle_ocr_failed = False
             lines = self._ocr_lines_via_paddleocr(image)
-            if lines or self.ocr_fallback == "none":
+            if not self._last_paddle_ocr_failed or self.ocr_fallback == "none":
                 log.info(
                     "OCR 操作完成：engine=paddleocr image=%s lines=%s elapsed=%.3fs",
                     image,
@@ -277,7 +279,7 @@ class ScreenInspector:
                     time.monotonic() - started,
                 )
                 return lines
-            log.info("PaddleOCR 不可用或未识别到文本，尝试 Windows OCR")
+            log.info("PaddleOCR 执行失败，尝试 Windows OCR")
             lines = self._ocr_lines_via_windows_ocr(image)
             log.info(
                 "OCR 操作完成：engine=windows_fallback image=%s lines=%s elapsed=%.3fs",
@@ -337,6 +339,7 @@ class ScreenInspector:
         try:
             from paddleocr import PaddleOCR  # type: ignore
         except Exception as exc:
+            self._last_paddle_ocr_failed = True
             log.info("PaddleOCR 依赖不可用：%s", exc)
             return []
         if self._paddle_ocr is None:
@@ -348,6 +351,7 @@ class ScreenInspector:
                 except TypeError:
                     self._paddle_ocr = PaddleOCR(lang=self.ocr_lang, **kwargs)
             except Exception as exc:
+                self._last_paddle_ocr_failed = True
                 log.warning("PaddleOCR 初始化失败：%s", exc)
                 return []
             log.info("PaddleOCR 初始化完成：elapsed=%.3fs", time.monotonic() - init_started)
@@ -359,6 +363,7 @@ class ScreenInspector:
             else:
                 raw = ocr.ocr(str(image_path), cls=True)
         except Exception as exc:
+            self._last_paddle_ocr_failed = True
             log.warning("PaddleOCR 识别失败：%s", exc)
             return []
         lines = self._parse_paddleocr_result(raw)

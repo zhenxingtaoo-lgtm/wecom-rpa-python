@@ -77,7 +77,6 @@ try {
   New-Item -ItemType Directory -Force $ReleaseRoot | Out-Null
   Copy-Item -Recurse -Force (Join-Path $DistRoot "wecom-rpa") $AppRoot
   Copy-Item -Recurse -Force (Join-Path $DistRoot "wecom-rpa-gui\*") $AppRoot
-  Copy-Item -Recurse -Force config (Join-Path $ReleaseRoot "config")
   if (Test-Path "templates") {
     Copy-Item -Recurse -Force templates (Join-Path $ReleaseRoot "templates")
   }

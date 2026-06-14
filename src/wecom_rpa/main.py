@@ -8,7 +8,7 @@ from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
-from .config import load_config
+from .config import build_runtime_config
 from .forward_flow import ForwardFlow
 from .screen import ScreenInspector
 
@@ -24,8 +24,10 @@ def setup_logging(log_file: str | Path) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="企业微信桌面端批量转发 RPA")
-    parser.add_argument("--config", default="config/config.example.yaml", help="配置 YAML 路径")
     parser.add_argument("--send-count", type=int, help="本次计划从会话列表底部发送的会话数量")
+    parser.add_argument("--batch-size", type=int, default=9, help="每批会话数量，最大 9")
+    parser.add_argument("--batch-interval-sec", type=float, default=0.0, help="批次之间等待秒数")
+    parser.add_argument("--sentinel-name", action="append", default=[], help="哨兵会话名称，可重复指定")
     parser.add_argument("--log-file", default="logs/wecom_rpa.log", help="日志文件路径")
     parser.add_argument("--screenshot-dir", default="screenshots", help="截图/占位文件目录")
     parser.add_argument("--yes", action="store_true", help="跳过人工确认（用于测试/cron；仍保持 dry-run）")
@@ -47,7 +49,15 @@ def main(argv: list[str] | None = None) -> int:
     log = logging.getLogger(__name__)
     try:
         allow_real_send = bool(args.real_send and args.i_understand_this_will_send_messages)
-        config = load_config(args.config, force_dry_run=args.dry_run, allow_real_send=allow_real_send)
+        dry_run = True if args.dry_run is None else bool(args.dry_run)
+        config = build_runtime_config(
+            dry_run=dry_run,
+            batch_size=args.batch_size,
+            batch_interval_sec=args.batch_interval_sec,
+            sentinel_enabled=bool(args.sentinel_name),
+            sentinel_names=args.sentinel_name,
+            allow_real_send=allow_real_send,
+        )
         if args.check_ocr_models:
             inspector = ScreenInspector(
                 args.screenshot_dir,
@@ -76,7 +86,6 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
                     "send_count": args.send_count,
-                    "config_path": str(Path(args.config).resolve()),
                     "effective_config": asdict(config),
                 },
                 ensure_ascii=False,

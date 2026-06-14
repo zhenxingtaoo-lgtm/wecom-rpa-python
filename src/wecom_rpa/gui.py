@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from .config import AppConfig, load_config
+from .config import AppConfig, build_runtime_config
 from .forward_flow import FlowResult, ForwardFlow
 from .powershell import terminate_active_powershell
 from .safety import StopController
@@ -24,13 +24,14 @@ log = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class GuiRunOptions:
-    config_path: Path
     log_file: Path
     screenshot_dir: Path
     send_count: int
     dry_run: bool = True
-    batch_size: int | None = None
-    batch_interval_sec: float | None = None
+    batch_size: int = 9
+    batch_interval_sec: float = 0.0
+    sentinel_enabled: bool = False
+    sentinel_names: tuple[str, ...] = ()
     confirm_real_send: bool = False
     confirm_source_review: bool = False
 
@@ -107,29 +108,20 @@ def validate_real_send_ready(*, dry_run: bool, confirm_send: bool, confirm_revie
         raise ValueError("真实发送确认未完成：必须勾选两个真实发送确认项")
 
 
-def _apply_config_overrides(config: AppConfig, options: GuiRunOptions) -> AppConfig:
-    overrides: dict[str, Any] = {"dry_run": options.dry_run}
-    if options.batch_size is not None:
-        overrides["batch_size"] = int(options.batch_size)
-    if options.batch_interval_sec is not None:
-        overrides["batch_interval_sec"] = float(options.batch_interval_sec)
-    updated = replace(config, **overrides)
-    updated.validate(allow_real_send=not updated.dry_run)
-    return updated
-
-
 def inspect_run_setup(options: GuiRunOptions) -> RunInspection:
     validate_real_send_ready(
         dry_run=options.dry_run,
         confirm_send=options.confirm_real_send,
         confirm_review=options.confirm_source_review,
     )
-    config = load_config(
-        options.config_path,
-        force_dry_run=options.dry_run,
+    config = build_runtime_config(
+        dry_run=options.dry_run,
+        batch_size=options.batch_size,
+        batch_interval_sec=options.batch_interval_sec,
+        sentinel_enabled=options.sentinel_enabled,
+        sentinel_names=list(options.sentinel_names),
         allow_real_send=not options.dry_run,
     )
-    config = _apply_config_overrides(config, options)
     if options.send_count <= 0:
         raise ValueError("发送数量必须 > 0")
 
@@ -155,7 +147,6 @@ def write_run_snapshot(options: GuiRunOptions, inspection: RunInspection) -> Pat
         }
     payload = {
         "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "config_path": str(options.config_path.resolve()),
         "log_file": str(options.log_file.resolve()),
         "screenshot_dir": str(options.screenshot_dir.resolve()),
         "send_count": inspection.send_count,
@@ -352,7 +343,7 @@ class WeComRpaApp:
         self.root.geometry(f"{self.layout.width}x{self.layout.height}")
         self.root.minsize(self.layout.min_width, self.layout.min_height)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.ttk.Style().configure("Danger.TButton", foreground="#b00020")
+        self._configure_styles()
         self.dpi_info = (
             "GUI DPI 信息："
             f"screen={self.root.winfo_screenwidth()}x{self.root.winfo_screenheight()} "
@@ -369,18 +360,20 @@ class WeComRpaApp:
         self.worker: threading.Thread | None = None
         self.stop_controller: StopController | None = None
         self.current_inspection: RunInspection | None = None
+        self.run_started_at: float | None = None
         self.last_check_passed = False
         self.queue_log_handler: QueueLogHandler | None = None
         self.file_log_handler: logging.FileHandler | None = None
 
         self.status_var = tk.StringVar(value="未启动")
-        self.config_var = tk.StringVar(value=str(self._default_config_path()))
         self.log_file_var = tk.StringVar(value="logs/wecom_rpa.log")
         self.screenshot_dir_var = tk.StringVar(value="screenshots")
         self.mode_var = tk.StringVar(value="dry_run")
         self.send_count_var = tk.StringVar(value="")
-        self.batch_size_var = tk.StringVar(value="")
-        self.batch_interval_var = tk.StringVar(value="")
+        self.batch_size_var = tk.StringVar(value="9")
+        self.batch_interval_var = tk.StringVar(value="0")
+        self.sentinel_enabled_var = tk.BooleanVar(value=False)
+        self.sentinel_names_var = tk.StringVar(value="")
         self.confirm_real_var = tk.BooleanVar(value=False)
         self.confirm_review_var = tk.BooleanVar(value=False)
         self.source_ready_var = tk.BooleanVar(value=False)
@@ -406,11 +399,9 @@ class WeComRpaApp:
                 continue
         self.title_font = ("", title_size, "bold")
 
-    def _default_config_path(self) -> Path:
-        preferred = Path("config/real_send_until_daxiaochen.yaml")
-        if preferred.exists():
-            return preferred
-        return Path("config/config.example.yaml")
+    def _configure_styles(self) -> None:
+        style = self.ttk.Style()
+        style.configure("Danger.TButton", foreground="#b00020")
 
     def _build_ui(self) -> None:
         tk = self.tk
@@ -420,49 +411,74 @@ class WeComRpaApp:
         self.root.rowconfigure(1, weight=0)
         self.root.rowconfigure(2, weight=1)
 
-        header = ttk.Frame(self.root, padding=(12, 10))
+        header = ttk.Frame(self.root, padding=(20, 16, 20, 10), style="Header.TFrame")
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(0, weight=1)
-        ttk.Label(header, text="企业微信批量转发 RPA", font=self.title_font).grid(row=0, column=0, sticky="w")
-        ttk.Label(header, textvariable=self.status_var).grid(row=0, column=1, sticky="e")
+        ttk.Label(header, text="企业微信批量转发 RPA", font=self.title_font, style="Header.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(header, textvariable=self.status_var, style="Status.TLabel").grid(row=0, column=1, sticky="e")
 
-        middle = ttk.Frame(self.root, padding=(12, 0, 12, 8))
+        middle = ttk.Frame(self.root, padding=(20, 8, 20, 10), style="Content.TFrame")
         middle.grid(row=1, column=0, sticky="nsew")
         middle.columnconfigure(0, weight=3)
         middle.columnconfigure(1, weight=2)
         middle.rowconfigure(0, weight=1)
 
-        params = ttk.LabelFrame(middle, text="参数设置", padding=10)
-        params.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        params.columnconfigure(1, weight=1)
+        params = ttk.Frame(middle, style="Content.TFrame")
+        params.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+        params.columnconfigure(0, weight=1)
 
-        self._file_row(params, 0, "配置文件", self.config_var, self._browse_config)
-        self._file_row(params, 1, "日志文件", self.log_file_var, self._browse_log)
-        self._file_row(params, 2, "截图目录", self.screenshot_dir_var, self._browse_screenshot_dir)
+        notice = ttk.Label(
+            params,
+            text="本软件仅供内部使用，可能存在运行风险，使用此软件即代表使用者已明确知晓风险且自行承担相应后果。",
+            justify="left",
+            anchor="w",
+            wraplength=700,
+            style="Risk.TLabel",
+        )
+        notice.grid(row=0, column=0, sticky="ew", pady=(0, 14))
 
-        mode_frame = ttk.Frame(params)
-        mode_frame.grid(row=3, column=0, columnspan=3, sticky="w", pady=(10, 4))
-        ttk.Label(mode_frame, text="运行模式").grid(row=0, column=0, padx=(0, 12))
+        mode_frame = ttk.Frame(params, style="Content.TFrame")
+        mode_frame.grid(row=1, column=0, sticky="w", pady=(0, 8))
+        ttk.Label(mode_frame, text="运行模式", style="Panel.TLabel").grid(row=0, column=0, padx=(0, 14))
         ttk.Radiobutton(mode_frame, text="Dry-run 自检", variable=self.mode_var, value="dry_run", command=self._invalidate_check).grid(row=0, column=1)
         ttk.Radiobutton(mode_frame, text="真实发送", variable=self.mode_var, value="real_send", command=self._invalidate_check).grid(row=0, column=2, padx=(12, 0))
 
-        overrides = ttk.LabelFrame(params, text="覆盖参数", padding=8)
-        overrides.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(8, 4))
+        overrides = ttk.LabelFrame(params, text="运行参数", padding=(12, 10), style="Panel.TLabelframe")
+        overrides.grid(row=2, column=0, sticky="ew", pady=(6, 4))
         for column in range(6):
             overrides.columnconfigure(column, weight=1)
-        ttk.Label(overrides, text="发送数量").grid(row=0, column=0, sticky="w")
+        ttk.Label(overrides, text="发送数量", style="Panel.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Entry(overrides, textvariable=self.send_count_var, width=8).grid(row=0, column=1, sticky="w")
-        ttk.Label(overrides, text="batch_size").grid(row=0, column=2, sticky="w")
+        ttk.Label(overrides, text="每批数量", style="Panel.TLabel").grid(row=0, column=2, sticky="w")
         ttk.Entry(overrides, textvariable=self.batch_size_var, width=8).grid(row=0, column=3, sticky="w")
-        ttk.Label(overrides, text="间隔秒").grid(row=0, column=4, sticky="w")
+        ttk.Label(overrides, text="间隔秒", style="Panel.TLabel").grid(row=0, column=4, sticky="w")
         ttk.Entry(overrides, textvariable=self.batch_interval_var, width=8).grid(row=0, column=5, sticky="w")
 
-        confirm = ttk.LabelFrame(params, text="真实发送确认", padding=8)
-        confirm.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(8, 0))
-        ttk.Checkbutton(confirm, text="我理解这会真实发送企业微信消息", variable=self.confirm_real_var, command=self._invalidate_check).grid(row=0, column=0, sticky="w")
-        ttk.Checkbutton(confirm, text="我已人工确认源消息和哨兵配置正确", variable=self.confirm_review_var, command=self._invalidate_check).grid(row=1, column=0, sticky="w")
+        sentinel = ttk.LabelFrame(params, text="哨兵边界", padding=(12, 10), style="Panel.TLabelframe")
+        sentinel.grid(row=3, column=0, sticky="ew", pady=(8, 4))
+        sentinel.columnconfigure(1, weight=1)
+        ttk.Checkbutton(
+            sentinel,
+            text="启用哨兵",
+            variable=self.sentinel_enabled_var,
+            command=self._invalidate_check,
+            style="Panel.TCheckbutton",
+        ).grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(sentinel, text="名称（多个用逗号分隔）", style="Panel.TLabel").grid(row=0, column=1, sticky="w")
+        ttk.Entry(sentinel, textvariable=self.sentinel_names_var).grid(
+            row=1,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            pady=(4, 0),
+        )
 
-        right = ttk.LabelFrame(middle, text="运行摘要 / 准备检查", padding=10)
+        confirm = ttk.LabelFrame(params, text="真实发送确认", padding=(12, 10), style="Panel.TLabelframe")
+        confirm.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        ttk.Checkbutton(confirm, text="我理解这会真实发送企业微信消息", variable=self.confirm_real_var, command=self._invalidate_check, style="Panel.TCheckbutton").grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(confirm, text="我已人工确认源消息和哨兵配置正确", variable=self.confirm_review_var, command=self._invalidate_check, style="Panel.TCheckbutton").grid(row=1, column=0, sticky="w", pady=(4, 0))
+
+        right = ttk.LabelFrame(middle, text="运行摘要与检查", padding=(14, 12), style="Panel.TLabelframe")
         right.grid(row=0, column=1, sticky="nsew")
         right.columnconfigure(0, weight=1)
         right.rowconfigure(0, weight=1)
@@ -472,29 +488,41 @@ class WeComRpaApp:
             justify="left",
             anchor="nw",
             wraplength=360,
+            style="Panel.TLabel",
         )
         self.summary_label.grid(row=0, column=0, sticky="nsew")
         ttk.Separator(right).grid(row=1, column=0, sticky="ew", pady=8)
-        ttk.Checkbutton(right, text="源消息勾选检测通过", variable=self.source_ready_var, state="disabled").grid(row=2, column=0, sticky="w")
+        ttk.Checkbutton(
+            right,
+            text="源消息勾选检测通过",
+            variable=self.source_ready_var,
+            state="disabled",
+            style="Panel.TCheckbutton",
+        ).grid(row=2, column=0, sticky="w")
         self.check_button = ttk.Button(right, text="检查环境", command=self._check_environment)
-        self.check_button.grid(row=3, column=0, sticky="w", pady=(10, 0))
+        self.check_button.grid(row=3, column=0, sticky="ew", pady=(12, 0))
 
-        log_frame = ttk.LabelFrame(self.root, text="运行日志", padding=8)
-        log_frame.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 8))
+        log_frame = ttk.LabelFrame(self.root, text="运行日志", padding=10, style="Panel.TLabelframe")
+        log_frame.grid(row=2, column=0, sticky="nsew", padx=20, pady=(0, 10))
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(2, weight=1)
-        ttk.Label(log_frame, textvariable=self.progress_var).grid(row=0, column=0, sticky="w")
-        ttk.Label(log_frame, textvariable=self.latest_screenshot_var).grid(row=1, column=0, sticky="w")
-        self.log_text = tk.Text(log_frame, height=10, wrap="word", state="disabled")
+        ttk.Label(log_frame, textvariable=self.progress_var, style="Panel.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(log_frame, textvariable=self.latest_screenshot_var, style="Panel.TLabel").grid(row=1, column=0, sticky="w", pady=(2, 8))
+        self.log_text = tk.Text(
+            log_frame,
+            height=10,
+            wrap="word",
+            state="disabled",
+        )
         self.log_text.grid(row=2, column=0, sticky="nsew")
         scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
         scrollbar.grid(row=2, column=1, sticky="ns")
         self.log_text.configure(yscrollcommand=scrollbar.set)
 
-        footer = ttk.Frame(self.root, padding=(12, 0, 12, 12))
+        footer = ttk.Frame(self.root, padding=(20, 2, 20, 16))
         footer.grid(row=3, column=0, sticky="ew")
         footer.columnconfigure(4, weight=1)
-        self.start_button = ttk.Button(footer, text="启动运行", command=self._start_run)
+        self.start_button = ttk.Button(footer, text="启动运行", command=self._start_run, style="Primary.TButton")
         self.start_button.grid(row=0, column=0, padx=(0, 8))
         self.stop_button = ttk.Button(footer, text="立即停止", command=self._request_stop, style="Danger.TButton")
         self.stop_button.grid(row=0, column=1, padx=(0, 8))
@@ -505,51 +533,23 @@ class WeComRpaApp:
         self.exit_button.grid(row=0, column=6)
 
         for var in (
-            self.config_var,
-            self.log_file_var,
-            self.screenshot_dir_var,
             self.send_count_var,
             self.batch_size_var,
             self.batch_interval_var,
+            self.sentinel_names_var,
         ):
             var.trace_add("write", lambda *_args: self._invalidate_check())
 
-    def _file_row(self, parent: Any, row: int, label: str, variable: Any, command: Any) -> None:
-        ttk = self.ttk
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=2)
-        ttk.Entry(parent, textvariable=variable).grid(row=row, column=1, sticky="ew", padx=(8, 6), pady=2)
-        ttk.Button(parent, text="浏览", command=command, width=6).grid(row=row, column=2, sticky="e", pady=2)
-
-    def _browse_config(self) -> None:
-        from tkinter import filedialog
-
-        path = filedialog.askopenfilename(filetypes=[("YAML", "*.yaml *.yml"), ("All files", "*.*")])
-        if path:
-            self.config_var.set(path)
-
-    def _browse_log(self) -> None:
-        from tkinter import filedialog
-
-        path = filedialog.asksaveasfilename(defaultextension=".log", filetypes=[("Log", "*.log"), ("All files", "*.*")])
-        if path:
-            self.log_file_var.set(path)
-
-    def _browse_screenshot_dir(self) -> None:
-        from tkinter import filedialog
-
-        path = filedialog.askdirectory()
-        if path:
-            self.screenshot_dir_var.set(path)
-
     def _options_from_form(self) -> GuiRunOptions:
         return GuiRunOptions(
-            config_path=Path(self.config_var.get()),
             log_file=Path(self.log_file_var.get()),
             screenshot_dir=Path(self.screenshot_dir_var.get()),
             send_count=self._required_positive_int(self.send_count_var.get(), "发送数量"),
             dry_run=self.mode_var.get() == "dry_run",
-            batch_size=self._optional_int(self.batch_size_var.get()),
-            batch_interval_sec=self._optional_float(self.batch_interval_var.get()),
+            batch_size=self._required_positive_int(self.batch_size_var.get(), "每批数量"),
+            batch_interval_sec=self._required_non_negative_float(self.batch_interval_var.get(), "批次间隔"),
+            sentinel_enabled=bool(self.sentinel_enabled_var.get()),
+            sentinel_names=tuple(self._parse_sentinel_names(self.sentinel_names_var.get())),
             confirm_real_send=bool(self.confirm_real_var.get()),
             confirm_source_review=bool(self.confirm_review_var.get()),
         )
@@ -578,6 +578,16 @@ class WeComRpaApp:
         except ValueError as exc:
             raise ValueError(f"覆盖参数必须是数字：{value}") from exc
 
+    def _required_non_negative_float(self, value: str, label: str) -> float:
+        parsed = self._optional_float(value)
+        if parsed is None or parsed < 0:
+            raise ValueError(f"{label}必须是大于等于 0 的数字")
+        return parsed
+
+    def _parse_sentinel_names(self, value: str) -> list[str]:
+        normalized = value.replace("，", ",").replace("、", ",").replace("\n", ",")
+        return [name.strip() for name in normalized.split(",") if name.strip()]
+
     def _check_log(self, message: str, log_file: Path | None = None) -> None:
         line = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} CHECK {message}"
         self._append_log(line)
@@ -601,10 +611,11 @@ class WeComRpaApp:
             self._check_log(
                 "开始检查环境："
                 f"mode={'dry_run' if options.dry_run else 'real_send'} "
-                f"config={options.config_path} send_count={options.send_count}",
+                f"send_count={options.send_count} batch_size={options.batch_size} "
+                f"sentinel={list(options.sentinel_names) if options.sentinel_enabled else 'disabled'}",
                 options.log_file,
             )
-            self._check_log("加载配置和本次运行参数", options.log_file)
+            self._check_log("构建并校验本次运行参数", options.log_file)
             inspection = inspect_run_setup(options)
             self._check_log(
                 "配置检查完成："
@@ -702,7 +713,7 @@ class WeComRpaApp:
         self.summary_var.set(
             "\n".join(
                 [
-                    "配置状态: 已加载",
+                    "参数状态: 已校验",
                     f"发送数量: {inspection.send_count}",
                     f"计划批次: {inspection.batch_count}",
                     f"运行模式: {'Dry-run 自检' if inspection.config.dry_run else '真实发送'}",
@@ -763,6 +774,7 @@ class WeComRpaApp:
             return
 
         self.stop_controller = StopController(self.current_inspection.config.stop_hotkey)
+        self.run_started_at = time.monotonic()
         self._set_running(True)
         self.worker = threading.Thread(target=self._run_worker, args=(options, self.current_inspection, self.stop_controller), daemon=True)
         self.worker.start()
@@ -876,17 +888,61 @@ class WeComRpaApp:
     def _handle_finished(self, result: FlowResult) -> None:
         from tkinter import messagebox
 
+        elapsed = self._current_run_elapsed()
         self._set_running(False)
-        self.status_var.set(f"状态: {result.status}")
-        self.progress_var.set(f"运行完成: summary={result.summary}")
-        messagebox.showinfo("运行完成", f"status={result.status}\nsummary={result.summary}")
+        planned = int(result.summary.get("planned", 0))
+        sent = int(result.summary.get("sent", 0))
+        status_text = "已完成" if result.status == "completed" else "已停止"
+        elapsed_text = self._format_elapsed(elapsed)
+        self.status_var.set(f"状态: {status_text}")
+        self.progress_var.set(f"运行{status_text}：实际发送 {sent} 个会话，总耗时 {elapsed_text}")
+        log.info(
+            "本次运行结束：status=%s planned=%s sent=%s elapsed=%.2fs",
+            result.status,
+            planned,
+            sent,
+            elapsed,
+        )
+        messagebox.showinfo(
+            "运行完成",
+            "\n".join(
+                [
+                    f"本次运行{status_text}。",
+                    f"计划处理：{planned} 个会话",
+                    f"实际发送：{sent} 个会话",
+                    f"总耗时：{elapsed_text}",
+                ]
+            ),
+        )
+        self.run_started_at = None
 
     def _handle_failed(self, exc: Exception) -> None:
         from tkinter import messagebox
 
+        elapsed = self._current_run_elapsed()
         self._set_running(False)
         self.status_var.set("状态: 失败")
-        messagebox.showerror("运行失败", str(exc))
+        messagebox.showerror(
+            "运行失败",
+            f"本次运行未完成。\n总耗时：{self._format_elapsed(elapsed)}\n\n错误信息：{exc}",
+        )
+        self.run_started_at = None
+
+    def _current_run_elapsed(self) -> float:
+        if self.run_started_at is None:
+            return 0.0
+        return max(0.0, time.monotonic() - self.run_started_at)
+
+    @staticmethod
+    def _format_elapsed(seconds: float) -> str:
+        total_seconds = max(0, round(seconds))
+        minutes, remaining_seconds = divmod(total_seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            return f"{hours}小时{minutes}分{remaining_seconds}秒"
+        if minutes:
+            return f"{minutes}分{remaining_seconds}秒"
+        return f"{remaining_seconds}秒"
 
     def _set_running(self, running: bool) -> None:
         state = "disabled" if running else "normal"

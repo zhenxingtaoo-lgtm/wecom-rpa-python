@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from wecom_rpa.config import load_config
+from wecom_rpa.config import build_runtime_config
 from wecom_rpa.forward_flow import ForwardFlow
 
 
@@ -22,10 +22,6 @@ def _points_payload(points: list[tuple[float, float]]) -> list[list[float]]:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="验证源消息重新勾选；不会打开收件人弹窗或点击发送按钮。"
-    )
-    parser.add_argument(
-        "--config",
-        default="config/real_send_until_daxiaochen.yaml",
     )
     parser.add_argument("--expected-count", type=int, default=4)
     parser.add_argument("--reselect", action="store_true")
@@ -49,9 +45,8 @@ def main() -> int:
     }
 
     try:
-        config = load_config(
-            args.config,
-            force_dry_run=False,
+        config = build_runtime_config(
+            dry_run=False,
             allow_real_send=True,
         )
         flow = ForwardFlow(

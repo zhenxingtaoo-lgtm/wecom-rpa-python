@@ -1,78 +1,71 @@
-# 企业微信 RPA 实机校准指南
+# 企业微信 RPA 实机检查与校准指南
 
-> 校准命令只做截图、裁剪、dry-run 自检；真实发送只允许通过主程序显式授权参数运行。
+当前主流程会在 GUI“检查环境”阶段自动识别源消息蓝勾和“逐条转发”按钮。校准工具主要用于排查窗口定位、DPI 和截图区域，不是日常运行的必需步骤。
 
-## 1. 基础自检
+## 窗口截图自检
 
-在 Windows 原生项目目录执行：
-
-```bash
-cd C:\path\to\wecom-rpa
-$env:PYTHONPATH='src'
-python -m wecom_rpa.calibration probe --crop-suggestions
+```powershell
+.\.venv-paddle-win\Scripts\python.exe -m wecom_rpa.calibration probe --crop-suggestions
 ```
 
-成功时会输出：
+该命令只截图和裁剪，不点击企业微信。输出包括：
 
-- 企业微信窗口矩形
-- `screenshots/checkpoints/wecom_window_probe_*.png` 窗口截图
-- `screenshots/calibration/*.png` 建议区域裁剪图
+- 企业微信窗口矩形；
+- `screenshots/checkpoints/wecom_window_probe_*.png`；
+- `screenshots/calibration/` 下的窗口区域参考图。
 
-如果提示未找到窗口：
+如果找不到窗口：
 
-1. 确认企业微信已打开且不是最小化。
-2. 点击一下企业微信主窗口，让它在前台。
-3. 再运行 probe。
+1. 确认企业微信已打开并登录。
+2. 确认主窗口没有最小化。
+3. 手动点击企业微信后重试。
 
-## 2. 建议区域说明
+## GUI 检查前状态
 
-`probe --crop-suggestions` 会自动生成这些区域：
+1. 企业微信显示源消息所在会话。
+2. 已进入消息多选状态。
+3. 已勾选本次需要转发的全部消息，数量不限于固定 2 条。
+4. 蓝色勾选框和底部“逐条转发”按钮均可见。
+5. 不要在检查过程中操作鼠标或切换窗口。
 
-- `window_full.png`：窗口整图，用于判断定位是否正确。
-- `search_box_area.png`：左上搜索框/加号区域。
-- `conversation_list.png`：会话列表区域。
-- `chat_header.png`：聊天标题栏。
-- `chat_content.png`：聊天内容区域。
-- `input_area.png`：输入框/工具栏区域。
-- `nav_bar.png`：左侧功能导航栏。
+点击“检查环境”后，程序会自动最大化企业微信并保存检查截图。识别完成后会弹窗并把 GUI 恢复到前台。
 
-这些不是最终按钮模板，只是校准参考图。
+## 检查失败排查
 
-## 3. 手动裁剪模板
+### 未识别到源消息
 
-当用户把企业微信切到对应状态后，可以从窗口截图里裁剪模板：
+- 查看最新 `gui_source_selection_check_*.png`。
+- 确认蓝勾位于同一列。
+- 确认消息没有超出当前可见区域。
+- 检查 Windows 显示缩放或截图是否异常。
 
-```bash
-$env:PYTHONPATH='src'
-python -m wecom_rpa.calibration crop `
+### 未识别到逐条转发
+
+- 查看检查截图底部工具栏是否完整。
+- 确认企业微信窗口已经最大化。
+- 查看日志中的 PaddleOCR 文本和耗时。
+
+### 滚动条拖动失败
+
+- 查看 `recipient_scroll_before` 和 `recipient_scroll_after_drag_*`。
+- 日志中拖动结果必须为 `moved=True` 且差异大于阈值。
+- 后续复核截图应连续两轮 `difference=0.000`。
+- 拖动无效时程序会停止，不会继续选择会话。
+
+## 手动裁剪
+
+仅在开发模板或分析截图时使用：
+
+```powershell
+.\.venv-paddle-win\Scripts\python.exe -m wecom_rpa.calibration crop `
   --source screenshots/checkpoints/wecom_window_probe_YYYYMMDD_HHMMSS.png `
-  --out templates/search_box.png `
+  --out templates/example.png `
   --left 80 --top 20 --width 220 --height 40
 ```
 
-注意：如果 `source` 是窗口局部截图，`left/top` 是相对这张截图左上角的坐标；如果 `source` 是全屏截图，`left/top` 是屏幕坐标。
+## 安全边界
 
-推荐模板文件名：
-
-- `forward_button.png`
-- `send_button.png`
-- `search_box.png`
-- `selected_checkmark.png`
-- `confirm_dialog.png`
-- `error_dialog.png`
-
-## 4. 当前仍需要人工配合的状态
-
-以下状态必须由用户手动摆好界面后再截图，不自动乱点：
-
-1. 已人工选中 2-5 条待转发消息。
-2. 已打开转发弹窗，但还没有点击发送。
-3. 搜索某个目标群后，搜索结果可见。
-4. 异常弹窗/确认弹窗出现时。
-
-## 5. 安全边界
-
-- `dry_run=false` 只有在主程序同时传入 `--real-send` 和 `--i-understand-this-will-send-messages` 时才允许。
-- `probe` 和 `crop` 只截图/裁剪，不点击鼠标键盘。
-- dry-run 流程只写状态库：`selected -> skipped`，不会写 `sent`。
-- 真实发送失败后如果状态变成 `uncertain`，续跑会阻塞，必须人工确认后再恢复。
+- `probe` 和 `crop` 不进行鼠标键盘操作。
+- 默认 Dry-run。
+- 真实发送需要完整显式授权。
+- 不使用状态库；中断后重新运行会从列表底部重新开始。

@@ -278,6 +278,48 @@ $r = New-Object Win32Rect+RECT
         log.info("点击屏幕坐标：abs=(%s, %s)", x, y)
         return self._click_point_via_pyautogui(x, y) or self._click_point_via_powershell(x, y)
 
+    def drag_screen(self, start_x: int, start_y: int, end_x: int, end_y: int, *, duration: float = 0.35) -> bool:
+        self._ensure_foreground()
+        log.info(
+            "拖动屏幕坐标：start=(%s, %s) end=(%s, %s) duration=%.2fs",
+            start_x,
+            start_y,
+            end_x,
+            end_y,
+            duration,
+        )
+        try:
+            import pyautogui
+
+            pyautogui.moveTo(start_x, start_y, duration=0.08)
+            time.sleep(0.15)
+            pyautogui.mouseDown(button="left")
+            try:
+                pyautogui.moveTo(end_x, end_y, duration=max(0.10, duration))
+            finally:
+                pyautogui.mouseUp(button="left")
+            current = pyautogui.position()
+            log.info(
+                "pyautogui 拖动完成：start=(%s, %s) end=(%s, %s) cursor=(%s, %s)",
+                start_x,
+                start_y,
+                end_x,
+                end_y,
+                current.x,
+                current.y,
+            )
+            return True
+        except Exception as exc:
+            log.warning(
+                "pyautogui 拖动失败：start=(%s, %s) end=(%s, %s) reason=%s",
+                start_x,
+                start_y,
+                end_x,
+                end_y,
+                exc,
+            )
+            return False
+
     def right_click_relative(self, rect: WindowRect, x_ratio: float, y_ratio: float) -> bool:
         self._ensure_foreground()
         point = rect.relative_point(x_ratio, y_ratio)

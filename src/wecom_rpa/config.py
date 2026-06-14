@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
-
-import yaml
 
 
 @dataclass(frozen=True)
@@ -18,7 +15,7 @@ class WindowConfig:
 class OcrConfig:
     engine: str = "paddleocr"
     lang: str = "ch"
-    fallback: str = "windows"
+    fallback: str = "none"
     model_root: str | None = None
 
 
@@ -127,44 +124,27 @@ class AppConfig:
             raise ValueError("第一版禁止 dry_run=false：真实点击发送尚未实现")
 
 
-def _section(data: dict[str, Any], key: str) -> dict[str, Any]:
-    value = data.get(key, {})
-    if value is None:
-        return {}
-    if not isinstance(value, dict):
-        raise ValueError(f"{key} 必须是对象")
-    return value
-
-
-def load_config(path: str | Path, *, force_dry_run: bool | None = None, allow_real_send: bool = False) -> AppConfig:
-    raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
-    if not isinstance(raw, dict):
-        raise ValueError("配置文件顶层必须是对象")
-    if force_dry_run is not None:
-        raw["dry_run"] = force_dry_run
-
-    cfg = AppConfig(
-        batch_size=int(raw.get("batch_size", 9)),
-        batch_interval_sec=float(raw.get("batch_interval_sec", 5)),
-        stop_hotkey=str(raw.get("stop_hotkey", "ctrl+alt+q")),
-        dry_run=bool(raw.get("dry_run", True)),
-        require_confirm_before_start=bool(raw.get("require_confirm_before_start", True)),
-        require_confirm_first_batch=bool(raw.get("require_confirm_first_batch", True)),
-        window=WindowConfig(**_section(raw, "window")),
-        ocr=OcrConfig(**_section(raw, "ocr")),
-        vision=VisionConfig(**_section(raw, "vision")),
-        recipient_selection=_load_recipient_selection(_section(raw, "recipient_selection")),
-        source_selection=SourceSelectionConfig(**_section(raw, "source_selection")),
+def build_runtime_config(
+    *,
+    dry_run: bool,
+    batch_size: int = 9,
+    batch_interval_sec: float = 0.0,
+    sentinel_enabled: bool = False,
+    sentinel_names: list[str] | None = None,
+    stop_hotkey: str = "ctrl+alt+q",
+    allow_real_send: bool = False,
+) -> AppConfig:
+    names = [name.strip() for name in (sentinel_names or []) if name.strip()]
+    config = AppConfig(
+        batch_size=int(batch_size),
+        batch_interval_sec=float(batch_interval_sec),
+        stop_hotkey=stop_hotkey,
+        dry_run=bool(dry_run),
+        require_confirm_before_start=False,
+        require_confirm_first_batch=False,
+        recipient_selection=RecipientSelectionConfig(
+            sentinel=SentinelConfig(enabled=bool(sentinel_enabled), names=names),
+        ),
     )
-    cfg.validate(allow_real_send=allow_real_send)
-    return cfg
-
-
-def _load_recipient_selection(data: dict[str, Any]) -> RecipientSelectionConfig:
-    raw = dict(data)
-    sentinel_raw = raw.pop("sentinel", {})
-    if sentinel_raw is None:
-        sentinel_raw = {}
-    if not isinstance(sentinel_raw, dict):
-        raise ValueError("recipient_selection.sentinel 必须是对象")
-    return RecipientSelectionConfig(sentinel=SentinelConfig(**sentinel_raw), **raw)
+    config.validate(allow_real_send=allow_real_send)
+    return config

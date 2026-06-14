@@ -18,7 +18,6 @@ if (-not (Test-Path $GuiExe)) {
 Push-Location $ReleasePath
 try {
   & $Exe `
-    --config config\config.example.yaml `
     --log-file logs\ocr_check.log `
     --screenshot-dir screenshots\ocr_check `
     --check-ocr-models
@@ -27,8 +26,8 @@ try {
   }
 
   & $Exe `
-    --config config\config.example.yaml `
     --send-count 1 `
+    --batch-size 9 `
     --log-file logs\release_dry_run.log `
     --screenshot-dir screenshots\release_dry_run `
     --yes `

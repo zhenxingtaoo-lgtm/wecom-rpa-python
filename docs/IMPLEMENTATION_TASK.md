@@ -1,4 +1,6 @@
-# 04:00 实现任务说明
+# 早期实现任务记录（已归档）
+
+> 本文仅保留历史背景，不代表当前实现。当前说明请参阅 `README.md` 和 `docs/DESIGN.md`。
 
 到 Asia/Shanghai `2026-05-22 04:00:00` 后执行。
 
@@ -6,21 +8,19 @@
 
 `/home/zhenx/.openclaw/workspace/wecom-rpa`
 
-## 必读文件
+## 状态
 
-- `docs/DESIGN.md`
-- `config/config.example.yaml`
-- `data/groups.example.csv`
+本文是早期实现任务记录。当前版本已取消 YAML、CSV 和 SQLite，运行参数由 GUI 或 CLI 提供。
 
 ## 实现范围
 
 实现企业微信 Windows 桌面端 RPA 第一版代码骨架：
 
-1. 配置加载与校验
-2. 目标/占位 CSV 读取、去重（默认 bottom_of_picker 模式下不按群名搜索）
-3. `max_total_send` 数量限制
+1. 运行时参数校验
+2. GUI/CLI 数量输入
+3. 发送数量限制
 4. `batch_size <= 9` 批次切分
-5. SQLite 状态库
+5. 运行参数快照
 6. dry-run 状态机
 7. 默认收件人选择策略：在选择聊天弹窗滚到底部，连续选择底部最多 9 个会话；不区分客户群/员工/机器人
 8. 日志
