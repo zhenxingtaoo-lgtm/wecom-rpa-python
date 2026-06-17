@@ -16,7 +16,15 @@ from .config import AppConfig, build_runtime_config
 from .forward_flow import FlowResult, ForwardFlow
 from .powershell import terminate_active_powershell
 from .safety import StopController
-from .screen import ScreenInspector, select_aligned_checkbox_column
+from .screen import (
+    SOURCE_CHECKBOX_COLUMN_MAX_X,
+    SOURCE_CHECKBOX_COLUMN_MAX_Y,
+    SOURCE_CHECKBOX_COLUMN_MIN_X,
+    SOURCE_CHECKBOX_COLUMN_MIN_Y,
+    ScreenInspector,
+    fullscreen_point_to_window_ratio,
+    select_aligned_checkbox_column,
+)
 from .wecom_window import WeComWindow
 
 log = logging.getLogger(__name__)
@@ -205,7 +213,8 @@ def inspect_source_selection(config: AppConfig, screenshot_dir: Path, rect: Any)
     fullscreen_points = [
         (x_ratio, y_ratio)
         for x_ratio, y_ratio in fullscreen_raw_points
-        if 0.18 <= x_ratio <= 0.50 and 0.08 <= y_ratio <= 0.82
+        if SOURCE_CHECKBOX_COLUMN_MIN_X <= x_ratio <= SOURCE_CHECKBOX_COLUMN_MAX_X
+        and SOURCE_CHECKBOX_COLUMN_MIN_Y <= y_ratio <= SOURCE_CHECKBOX_COLUMN_MAX_Y
     ]
     points = select_source_checkbox_column(converted_points)
     fullscreen_source_points = select_source_checkbox_column(fullscreen_points)
@@ -230,10 +239,10 @@ def select_source_checkbox_column(
 ) -> list[tuple[float, float]]:
     return select_aligned_checkbox_column(
         points,
-        min_x=0.18,
-        max_x=0.50,
-        min_y=0.08,
-        max_y=0.82,
+        min_x=SOURCE_CHECKBOX_COLUMN_MIN_X,
+        max_x=SOURCE_CHECKBOX_COLUMN_MAX_X,
+        min_y=SOURCE_CHECKBOX_COLUMN_MIN_Y,
+        max_y=SOURCE_CHECKBOX_COLUMN_MAX_Y,
         x_tolerance=x_tolerance,
     )
 
@@ -256,9 +265,16 @@ def detect_forward_button_ratio(inspector: ScreenInspector, image_path: Path, re
             continue
         center_x = line.left + line.width / 2.0
         center_y = line.top + line.height / 2.0
-        local_x = (center_x - rect.left) / rect.width
-        local_y = (center_y - rect.top) / rect.height
-        if 0.15 <= local_x <= 0.85 and 0.70 <= local_y <= 0.98:
+        mapped = fullscreen_point_to_window_ratio(
+            center_x,
+            center_y,
+            rect,
+            image_size,
+            x_range=(0.15, 0.85),
+            y_range=(0.70, 0.98),
+        )
+        if mapped is not None:
+            local_x, local_y = mapped
             candidates.append((local_x, local_y, line.text))
 
     if not candidates:
@@ -285,34 +301,28 @@ def convert_fullscreen_checkbox_ratios_to_window(
         return []
     image_width, image_height = image_size
     converted: list[tuple[float, float]] = []
-    scales = {1.0}
-    if image_width > rect.width * 1.25:
-        scales.add(image_width / rect.width)
-    if image_height > rect.height * 1.25:
-        scales.add(image_height / rect.height)
     raw_points = inspector.filter_source_checkbox_marker_points(
         image_path,
         list(inspector.find_selected_checkbox_ratios(image_path)),
     )
     seen: set[tuple[int, int]] = set()
-    for scale in scales:
-        scaled_left = rect.left * scale
-        scaled_top = rect.top * scale
-        scaled_width = rect.width * scale
-        scaled_height = rect.height * scale
-        for x_ratio, y_ratio in raw_points:
-            abs_x = x_ratio * image_width
-            abs_y = y_ratio * image_height
-            if not (scaled_left <= abs_x <= scaled_left + scaled_width and scaled_top <= abs_y <= scaled_top + scaled_height):
-                continue
-            local_x = (abs_x - scaled_left) / scaled_width
-            local_y = (abs_y - scaled_top) / scaled_height
-            if 0.18 <= local_x <= 0.50 and 0.08 <= local_y <= 0.82:
-                key = (round(local_x * 10000), round(local_y * 10000))
-                if key in seen:
-                    continue
-                seen.add(key)
-                converted.append((local_x, local_y))
+    for x_ratio, y_ratio in raw_points:
+        mapped = fullscreen_point_to_window_ratio(
+            x_ratio * image_width,
+            y_ratio * image_height,
+            rect,
+            image_size,
+            x_range=(SOURCE_CHECKBOX_COLUMN_MIN_X, SOURCE_CHECKBOX_COLUMN_MAX_X),
+            y_range=(SOURCE_CHECKBOX_COLUMN_MIN_Y, SOURCE_CHECKBOX_COLUMN_MAX_Y),
+        )
+        if mapped is None:
+            continue
+        local_x, local_y = mapped
+        key = (round(local_x * 10000), round(local_y * 10000))
+        if key in seen:
+            continue
+        seen.add(key)
+        converted.append((local_x, local_y))
     return converted
 
 

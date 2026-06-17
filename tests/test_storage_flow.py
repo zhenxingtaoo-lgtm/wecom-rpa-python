@@ -7,6 +7,7 @@ from PIL import Image, ImageDraw
 
 from wecom_rpa.config import AppConfig, RecipientSelectionConfig, SentinelConfig
 from wecom_rpa.forward_flow import ForwardFlow, SelectedRecipient
+from wecom_rpa.screen import OcrLine
 from wecom_rpa.wecom_window import WindowRect
 
 
@@ -91,6 +92,72 @@ class ForwardFlowTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "足够的会话复选框"):
                 flow._recipient_checkbox_points_bottom_to_top(2, WindowRect(0, 0, 1600, 900), 1)
 
+    def test_recipient_candidates_use_detected_scaled_checkbox_column(self):
+        with tempfile.TemporaryDirectory() as d:
+            flow = ForwardFlow(AppConfig(), screenshot_dir=d, install_stop_hotkey=False)
+
+            class FakeScreen:
+                def save_checkpoint(self, *_args, **_kwargs):
+                    return Path(d) / "fake.png"
+
+                def find_checkbox_outline_ratios(self, *_args, **_kwargs):
+                    return [
+                        (0.359, 0.368),
+                        (0.359, 0.414),
+                        (0.359, 0.458),
+                        (0.359, 0.504),
+                        (0.359, 0.549),
+                        (0.359, 0.594),
+                        (0.359, 0.639),
+                        (0.359, 0.685),
+                        (0.359, 0.729),
+                    ]
+
+            flow.screen = FakeScreen()
+
+            selected = flow._recipient_checkbox_points_bottom_to_top(9, WindowRect(-2, -2, 2564, 1384), 1)
+
+            self.assertEqual(
+                selected,
+                [
+                    (0.359, 0.729),
+                    (0.359, 0.685),
+                    (0.359, 0.639),
+                    (0.359, 0.594),
+                    (0.359, 0.549),
+                    (0.359, 0.504),
+                    (0.359, 0.458),
+                    (0.359, 0.414),
+                    (0.359, 0.368),
+                ],
+            )
+            self.assertAlmostEqual(flow._recipient_checkbox_x_ratio(WindowRect(-2, -2, 2564, 1384)), 0.359)
+
+    def test_final_send_button_uses_ocr_detected_button_location(self):
+        with tempfile.TemporaryDirectory() as d:
+            flow = ForwardFlow(AppConfig(), screenshot_dir=d, install_stop_hotkey=False)
+
+            class FakeScreen:
+                def save_checkpoint(self, *_args, **_kwargs):
+                    return Path(d) / "send_button.png"
+
+                def ocr_lines(self, *, image_path):
+                    return [
+                        OcrLine("分别发送给", 1309, 378, 91, 30),
+                        OcrLine("分别发送", 1357, 976, 75, 35),
+                        OcrLine("取消", 1549, 979, 40, 27),
+                    ]
+
+                def image_size(self, _image_path):
+                    return (2564, 1384)
+
+            flow.screen = FakeScreen()
+
+            ratio = flow._detect_final_send_button_ratio(WindowRect(-2, -2, 2564, 1384))
+
+            self.assertAlmostEqual(ratio[0], (1357 + 75 / 2) / 2564, places=3)
+            self.assertAlmostEqual(ratio[1], (976 + 35 / 2) / 1384, places=3)
+
     def test_recipient_list_image_difference_detects_movement_and_stability(self):
         with tempfile.TemporaryDirectory() as d:
             before_path = Path(d) / "before.png"
@@ -137,7 +204,20 @@ class ForwardFlowTest(unittest.TestCase):
 
         self.assertEqual(
             candidates,
-            [(0.117, 0.75, 0.117), (0.527, 0.75, 0.527), (0.708, 0.75, 0.708)],
+            [
+                (0.117, 0.90, 0.117),
+                (0.117, 0.86, 0.117),
+                (0.117, 0.94, 0.117),
+                (0.117, 0.75, 0.117),
+                (0.527, 0.90, 0.527),
+                (0.527, 0.86, 0.527),
+                (0.527, 0.94, 0.527),
+                (0.527, 0.75, 0.527),
+                (0.708, 0.90, 0.708),
+                (0.708, 0.86, 0.708),
+                (0.708, 0.94, 0.708),
+                (0.708, 0.75, 0.708),
+            ],
         )
 
     def test_source_checkbox_detection_excludes_title_and_toolbar_blue_items(self):
@@ -210,6 +290,18 @@ class ForwardFlowTest(unittest.TestCase):
         self.assertLess(region.width * region.height, rect.width * rect.height * 0.20)
         self.assertLessEqual(region.left, 1500)
         self.assertGreaterEqual(region.left + region.width, 1500)
+
+    def test_source_context_menu_region_covers_popup_around_right_bubble(self):
+        flow = ForwardFlow(AppConfig(), install_stop_hotkey=False)
+        rect = WindowRect(-2, -2, 2564, 1384)
+        click_x, click_y = rect.relative_point(0.90, 0.643)
+
+        region = flow._source_context_menu_region(rect, 0.90, 0.643)
+
+        self.assertLessEqual(region.left, click_x - round(rect.width * 0.20))
+        self.assertGreaterEqual(region.left + region.width, min(rect.right, click_x + round(rect.width * 0.10)))
+        self.assertLessEqual(region.top, click_y - round(rect.height * 0.20))
+        self.assertGreaterEqual(region.top + region.height, min(rect.bottom, click_y + round(rect.height * 0.30)))
 
     def test_checkbox_scan_region_has_component_padding(self):
         flow = ForwardFlow(AppConfig(), install_stop_hotkey=False)

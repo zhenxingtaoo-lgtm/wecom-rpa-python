@@ -8,10 +8,22 @@ from typing import Any, Callable
 
 from .config import AppConfig
 from .safety import StopController, assert_batch_selection_count
-from .screen import Region, ScreenInspector, select_aligned_checkbox_column
+from .screen import (
+    SOURCE_CHECKBOX_COLUMN_MAX_X,
+    SOURCE_CHECKBOX_COLUMN_MAX_Y,
+    SOURCE_CHECKBOX_COLUMN_MIN_X,
+    SOURCE_CHECKBOX_COLUMN_MIN_Y,
+    Region,
+    ScreenInspector,
+    fullscreen_point_to_window_ratio,
+    select_aligned_checkbox_column,
+)
 from .wecom_window import WeComWindow, WindowRect
 
 log = logging.getLogger(__name__)
+
+
+SOURCE_CONTEXT_RIGHT_CLICK_X_RATIOS = (0.90, 0.86, 0.94, 0.75)
 
 
 @dataclass(frozen=True)
@@ -69,6 +81,7 @@ class ForwardFlow:
         self.sent_count = 0
         self._source_context_right_click: tuple[float, float, float] | None = None
         self._source_multiselect_menu_offset: tuple[int, int] | None = None
+        self._last_recipient_checkbox_x_ratio: float | None = None
 
     def _emit_progress(self, event: str, **payload: Any) -> None:
         if self.progress_callback is None:
@@ -463,14 +476,11 @@ class ForwardFlow:
         raise RuntimeError(f"点击逐条转发后未识别到发送给弹窗，已停止以避免误点会话列表。screenshot={picker_shot}")
 
     def _recipient_checkbox_x_ratio(self, rect: WindowRect) -> float:
+        if self._last_recipient_checkbox_x_ratio is not None:
+            return self._last_recipient_checkbox_x_ratio
         if rect.width >= 1600:
             return 0.302
         return 0.260
-
-    def _recipient_send_button_ratios(self, rect: WindowRect) -> tuple[float, float]:
-        if rect.width >= 1600:
-            return (0.563, 0.782)
-        return (0.574, 0.801)
 
     def _recipient_picker_title_region(self, rect: WindowRect) -> Region:
         return Region(
@@ -481,12 +491,105 @@ class ForwardFlow:
         )
 
     def _click_final_send_button(self, rect: WindowRect) -> bool:
-        send_x, send_y = self._recipient_send_button_ratios(rect)
+        detected = self._detect_final_send_button_ratio(rect)
+        if detected is None:
+            log.error("未能识别最终发送按钮，已停止避免误点：rect=%s", rect)
+            return False
+        send_x, send_y = detected
         click_x, click_y = rect.relative_point(send_x, send_y)
+        log.info(
+            "点击 OCR/图像识别到的最终发送按钮：ratio=(%.3f, %.3f) abs=(%s, %s)",
+            send_x,
+            send_y,
+            click_x,
+            click_y,
+        )
         click_screen = getattr(self.window, "click_screen", None)
         if callable(click_screen):
             return bool(click_screen(click_x, click_y))
         return bool(self.window.click_relative(rect, send_x, send_y))
+
+    def _detect_final_send_button_ratio(self, rect: WindowRect) -> tuple[float, float] | None:
+        image_path = self._save_window_checkpoint("final_send_button_probe", rect)
+        size_getter = getattr(self.screen, "image_size", None)
+        image_size = size_getter(image_path) if callable(size_getter) else None
+        if not image_size or image_size[0] <= 0 or image_size[1] <= 0:
+            image_size = (rect.width, rect.height)
+        image_width, image_height = image_size
+
+        try:
+            lines = self.screen.ocr_lines(image_path=image_path)
+        except Exception as exc:
+            log.warning("最终发送按钮 OCR 识别失败：%s", exc)
+            lines = []
+
+        candidates: list[tuple[int, float, float, str]] = []
+        for line in lines:
+            text = line.text.replace(" ", "")
+            if "分别发送给" in text or "发送给" == text:
+                continue
+            if "分别发送" in text:
+                priority = 2
+            elif text == "发送":
+                priority = 1
+            else:
+                continue
+            center_x = (line.left + line.width / 2.0) / image_width
+            center_y = (line.top + line.height / 2.0) / image_height
+            if 0.35 <= center_x <= 0.75 and 0.55 <= center_y <= 0.90:
+                candidates.append((priority, center_x, center_y, line.text))
+        if candidates:
+            _priority, x_ratio, y_ratio, text = sorted(
+                candidates,
+                key=lambda item: (item[0], -abs(item[1] - 0.55), item[2]),
+                reverse=True,
+            )[0]
+            log.info("识别到最终发送按钮：text=%s ratio=(%.3f, %.3f)", text, x_ratio, y_ratio)
+            return (x_ratio, y_ratio)
+
+        button = self._detect_blue_final_send_button_ratio(image_path, image_size)
+        if button is not None:
+            log.info("通过蓝色按钮区域识别到最终发送按钮：ratio=(%.3f, %.3f)", button[0], button[1])
+        return button
+
+    def _detect_blue_final_send_button_ratio(self, image_path, image_size: tuple[int, int]) -> tuple[float, float] | None:
+        try:
+            import cv2  # type: ignore
+            import numpy as np  # type: ignore
+        except Exception as exc:
+            log.debug("OpenCV/NumPy 不可用，跳过最终发送按钮蓝色区域识别：%s", exc)
+            return None
+
+        bitmap = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+        if bitmap is None:
+            return None
+        image_width, image_height = image_size
+        if image_width <= 0 or image_height <= 0:
+            return None
+        roi_left = round(image_width * 0.35)
+        roi_top = round(image_height * 0.55)
+        roi_right = round(image_width * 0.75)
+        roi_bottom = round(image_height * 0.90)
+        roi = bitmap[roi_top:roi_bottom, roi_left:roi_right]
+        if roi.size == 0:
+            return None
+        mask = cv2.inRange(
+            roi,
+            np.array((150, 80, 0), dtype=np.uint8),
+            np.array((255, 190, 110), dtype=np.uint8),
+        )
+        component_count, _labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=4)
+        candidates: list[tuple[int, float, float]] = []
+        for index in range(1, component_count):
+            _left, _top, width, height, area = (int(value) for value in stats[index])
+            if area < 600 or width < 60 or height < 20:
+                continue
+            center_x, center_y = centroids[index]
+            candidates.append((area, (roi_left + float(center_x)) / image_width, (roi_top + float(center_y)) / image_height))
+        if not candidates:
+            return None
+        _area, x_ratio, y_ratio = sorted(candidates, key=lambda item: item[0], reverse=True)[0]
+        return (x_ratio, y_ratio)
 
     def _recipient_scrollbar_track_point(self, rect: WindowRect) -> tuple[float, float]:
         if rect.width >= 1600:
@@ -732,11 +835,13 @@ class ForwardFlow:
                 scan_region_ratio=scan_region,
             )
         ) if callable(find_outlines) else []
-        candidates: list[tuple[float, float]] = []
-        for x_ratio, y_ratio in raw_points:
-            if min_x <= x_ratio <= max_x and min_y <= y_ratio <= max_y:
-                candidates.append((x_ratio, y_ratio))
-
+        candidates = select_aligned_checkbox_column(
+            raw_points,
+            min_x=min_x,
+            max_x=max_x,
+            min_y=min_y,
+            max_y=max_y,
+        )
         candidates = self._dedupe_recipient_checkbox_points(candidates)
         log.info(
             "收件人复选框候选识别：batch=%s expected=%s full_window=%s raw=%s filtered=%s",
@@ -759,6 +864,7 @@ class ForwardFlow:
             raise RuntimeError(f"未识别到足够的会话复选框：expected={selected_count} actual={len(candidates)}，已停止以避免误点。screenshot={image_path}")
 
         selected = sorted(candidates, key=lambda point: point[1], reverse=True)[:selected_count]
+        self._last_recipient_checkbox_x_ratio = sum(x for x, _y in selected) / len(selected)
         log.info("将从底部往上勾选收件人坐标：%s", [(round(x, 3), round(y, 3)) for x, y in selected])
         return selected
 
@@ -779,8 +885,8 @@ class ForwardFlow:
 
     def _recipient_checkbox_x_bounds(self, rect: WindowRect) -> tuple[float, float]:
         if rect.width >= 1600:
-            return (0.285, 0.330)
-        return (0.215, 0.310)
+            return (0.260, 0.430)
+        return (0.200, 0.380)
 
     def _recipient_checkbox_y_bounds(self, rect: WindowRect) -> tuple[float, float]:
         if rect.width >= 1600:
@@ -929,14 +1035,19 @@ class ForwardFlow:
         min_x, max_x = self._recipient_checkbox_x_bounds(rect)
         min_y, max_y = self._recipient_checkbox_y_bounds(rect)
         scan_region = self._expanded_checkbox_scan_region(min_x, min_y, max_x, max_y)
-        checkbox_points = [
-            (x_ratio, y_ratio)
-            for x_ratio, y_ratio in self.screen.find_selected_checkbox_ratios(
+        raw_points = list(
+            self.screen.find_selected_checkbox_ratios(
                 image_path,
                 scan_region_ratio=scan_region,
             )
-            if min_x <= x_ratio <= max_x and min_y <= y_ratio <= max_y
-        ]
+        )
+        checkbox_points = select_aligned_checkbox_column(
+            raw_points,
+            min_x=min_x,
+            max_x=max_x,
+            min_y=min_y,
+            max_y=max_y,
+        )
         log.info(
             "左侧已选会话复选框扫描：checkpoint=%s x_bounds=(%.3f, %.3f) y_bounds=(%.3f, %.3f) points=%s",
             checkpoint_name,
@@ -1242,7 +1353,12 @@ class ForwardFlow:
             list(
                 self.screen.find_selected_checkbox_ratios(
                     image_path,
-                    scan_region_ratio=(0.18, 0.07, 0.32, 0.76),
+                    scan_region_ratio=(
+                        SOURCE_CHECKBOX_COLUMN_MIN_X,
+                        0.07,
+                        SOURCE_CHECKBOX_COLUMN_MAX_X - SOURCE_CHECKBOX_COLUMN_MIN_X,
+                        0.76,
+                    ),
                 )
             ),
         )
@@ -1254,10 +1370,10 @@ class ForwardFlow:
     ) -> list[tuple[float, float]]:
         return select_aligned_checkbox_column(
             points,
-            min_x=0.18,
-            max_x=0.50,
-            min_y=0.08,
-            max_y=0.82,
+            min_x=SOURCE_CHECKBOX_COLUMN_MIN_X,
+            max_x=SOURCE_CHECKBOX_COLUMN_MAX_X,
+            min_y=SOURCE_CHECKBOX_COLUMN_MIN_Y,
+            max_y=SOURCE_CHECKBOX_COLUMN_MAX_Y,
         )
 
     def _source_selected_checkbox_ratios_in_window(self, image_path, rect: WindowRect | None) -> list[tuple[float, float]]:
@@ -1299,39 +1415,19 @@ class ForwardFlow:
             list(self.screen.find_selected_checkbox_ratios(image_path)),
         )
 
-        def convert_with_scale(scale: float) -> list[tuple[float, float]]:
-            converted: list[tuple[float, float]] = []
-            scaled_left = rect.left * scale
-            scaled_top = rect.top * scale
-            scaled_width = rect.width * scale
-            scaled_height = rect.height * scale
-            for x_ratio, y_ratio in raw_points:
-                abs_x = x_ratio * image_width
-                abs_y = y_ratio * image_height
-                if not (scaled_left <= abs_x <= scaled_left + scaled_width and scaled_top <= abs_y <= scaled_top + scaled_height):
-                    continue
-                local_x = (abs_x - scaled_left) / scaled_width
-                local_y = (abs_y - scaled_top) / scaled_height
-                if 0.18 <= local_x <= 0.50 and 0.08 <= local_y <= 0.82:
-                    converted.append((local_x, local_y))
-            return self._select_source_checkbox_column(converted)
-
-        primary = convert_with_scale(1.0)
-        if primary:
-            return primary
-
-        scales: list[float] = []
-        if image_width > rect.width * 1.25:
-            scales.append(image_width / rect.width)
-        if image_height > rect.height * 1.25:
-            height_scale = image_height / rect.height
-            if not any(abs(height_scale - existing) <= 0.02 for existing in scales):
-                scales.append(height_scale)
-        for scale in scales:
-            converted = convert_with_scale(scale)
-            if converted:
-                return converted
-        return []
+        converted: list[tuple[float, float]] = []
+        for x_ratio, y_ratio in raw_points:
+            mapped = fullscreen_point_to_window_ratio(
+                x_ratio * image_width,
+                y_ratio * image_height,
+                rect,
+                image_size,
+                x_range=(SOURCE_CHECKBOX_COLUMN_MIN_X, SOURCE_CHECKBOX_COLUMN_MAX_X),
+                y_range=(SOURCE_CHECKBOX_COLUMN_MIN_Y, SOURCE_CHECKBOX_COLUMN_MAX_Y),
+            )
+            if mapped is not None:
+                converted.append(mapped)
+        return self._select_source_checkbox_column(converted)
 
     def _enter_multiselect_from_source(self, rect: WindowRect) -> float:
         if self._source_context_right_click is not None and self._source_multiselect_menu_offset is not None:
@@ -1409,11 +1505,11 @@ class ForwardFlow:
         raise RuntimeError("无法通过右键菜单进入源消息多选：未识别到“多选”菜单项")
 
     def _source_context_menu_candidates(self) -> list[tuple[float, float, float]]:
-        # 复选框中心与对应消息气泡位于同一行。只在每条源消息的正文安全区域
-        # 尝试一次，避免旧逻辑的 40 个偏移坐标触发大量无效全屏 OCR。
+        # 源消息复选框只提供行坐标；发出的消息气泡贴近窗口右侧，保留 0.75 兼容旧布局。
         return [
-            (checkbox_y, 0.75, min(0.90, max(0.06, checkbox_y)))
+            (checkbox_y, right_click_x, min(0.90, max(0.06, checkbox_y)))
             for checkbox_y in sorted(self.source_checkbox_y_ratios)
+            for right_click_x in SOURCE_CONTEXT_RIGHT_CLICK_X_RATIOS
         ]
 
     def _source_context_menu_region(
@@ -1423,10 +1519,10 @@ class ForwardFlow:
         right_click_y: float,
     ) -> Region:
         click_x, click_y = rect.relative_point(right_click_x, right_click_y)
-        left = max(rect.left, click_x - round(rect.width * 0.22))
-        top = max(rect.top, click_y - round(rect.height * 0.35))
-        right = min(rect.right, click_x + round(rect.width * 0.05))
-        bottom = min(rect.bottom, click_y + round(rect.height * 0.15))
+        left = max(rect.left, click_x - round(rect.width * 0.24))
+        top = max(rect.top, click_y - round(rect.height * 0.25))
+        right = min(rect.right, click_x + round(rect.width * 0.12))
+        bottom = min(rect.bottom, click_y + round(rect.height * 0.30))
         return Region(left=left, top=top, width=max(1, right - left), height=max(1, bottom - top))
 
     def _source_multiselect_opened(self, rect: WindowRect, checkpoint_name: str) -> bool:

@@ -54,6 +54,55 @@ class OcrLine:
         return self.top + self.height // 2
 
 
+SOURCE_CHECKBOX_COLUMN_MIN_X = 0.14
+SOURCE_CHECKBOX_COLUMN_MAX_X = 0.50
+SOURCE_CHECKBOX_COLUMN_MIN_Y = 0.08
+SOURCE_CHECKBOX_COLUMN_MAX_Y = 0.82
+
+
+def window_coordinate_scales(rect: Any, image_size: tuple[int, int]) -> list[float]:
+    image_width, image_height = image_size
+    if image_width <= 0 or image_height <= 0 or rect.width <= 0 or rect.height <= 0:
+        return []
+
+    scales: list[float] = []
+
+    def add_scale(scale: float) -> None:
+        if scale <= 0 or scale < 0.40 or scale > 4.00:
+            return
+        if any(abs(scale - existing) <= 0.02 for existing in scales):
+            return
+        scales.append(scale)
+
+    add_scale(1.0)
+    add_scale(image_width / rect.width)
+    add_scale(image_height / rect.height)
+    return scales
+
+
+def fullscreen_point_to_window_ratio(
+    abs_x: float,
+    abs_y: float,
+    rect: Any,
+    image_size: tuple[int, int],
+    *,
+    x_range: tuple[float, float] = (0.0, 1.0),
+    y_range: tuple[float, float] = (0.0, 1.0),
+) -> tuple[float, float] | None:
+    for scale in window_coordinate_scales(rect, image_size):
+        scaled_left = rect.left * scale
+        scaled_top = rect.top * scale
+        scaled_width = rect.width * scale
+        scaled_height = rect.height * scale
+        if not (scaled_left <= abs_x <= scaled_left + scaled_width and scaled_top <= abs_y <= scaled_top + scaled_height):
+            continue
+        local_x = (abs_x - scaled_left) / scaled_width
+        local_y = (abs_y - scaled_top) / scaled_height
+        if x_range[0] <= local_x <= x_range[1] and y_range[0] <= local_y <= y_range[1]:
+            return (local_x, local_y)
+    return None
+
+
 def select_aligned_checkbox_column(
     points: list[tuple[float, float]],
     *,
