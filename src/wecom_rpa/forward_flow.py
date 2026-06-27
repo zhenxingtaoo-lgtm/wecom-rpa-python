@@ -45,6 +45,16 @@ class SentinelTrimPlan:
     boundary_reached: bool
 
 
+@dataclass
+class FastPathState:
+    window_rect: WindowRect | None = None
+    recipient_checkbox_points_bottom_to_top: list[tuple[float, float]] | None = None
+    recipient_scroll_drag: tuple[tuple[int, int], tuple[int, int]] | None = None
+    recipient_scroll_track: tuple[int, int] | None = None
+    final_send_button_ratio: tuple[float, float] | None = None
+    ready: bool = False
+
+
 class ForwardFlow:
     def __init__(
         self,
@@ -82,6 +92,7 @@ class ForwardFlow:
         self._source_context_right_click: tuple[float, float, float] | None = None
         self._source_multiselect_menu_offset: tuple[int, int] | None = None
         self._last_recipient_checkbox_x_ratio: float | None = None
+        self._fast_path = FastPathState()
 
     def _emit_progress(self, event: str, **payload: Any) -> None:
         if self.progress_callback is None:
@@ -248,18 +259,23 @@ class ForwardFlow:
     def _run_real_bottom_picker_batch(self, batch_no: int, selected_count: int) -> int:
         """实机方案：使用已校准的相对坐标完成一次底部会话批量发送。"""
         with self._step("定位企业微信窗口", batch=batch_no):
-            rect = self.window.locate()
+            rect = self._locate_or_reuse_window(batch_no)
         if rect is None:
             raise RuntimeError("真实发送需要先找到企业微信窗口")
 
         assert_batch_selection_count(selected_count, self.config.batch_size)
         log.warning("真实发送批次 %s：即将发送给 %s 个会话", batch_no, selected_count)
 
+        source_verified_by_reselect = False
         if batch_no > 1:
             with self._step("重新勾选源消息", batch=batch_no):
                 self._reselect_source_messages(rect)
-        with self._step("复查源消息勾选", batch=batch_no):
-            self._assert_exact_source_selection(rect, f"batch_{batch_no}_source_before_forward")
+            source_verified_by_reselect = self._can_use_fast_path(batch_no)
+        if source_verified_by_reselect:
+            log.info("快速模式：重新勾选源消息已完成内部复核，跳过额外源消息复查截图：batch=%s", batch_no)
+        else:
+            with self._step("复查源消息勾选", batch=batch_no):
+                self._assert_exact_source_selection(rect, f"batch_{batch_no}_source_before_forward")
 
         with self._step("打开收件人选择弹窗", batch=batch_no):
             self._open_recipient_picker_from_source(rect, batch_no)
@@ -400,18 +416,9 @@ class ForwardFlow:
                     raise RuntimeError("无法点击发送按钮")
             self._sleep(2.0)
             with self._step("发送后截图复查", batch=batch_no):
-                evidence = self.screen.save_checkpoint(f"batch_{batch_no}_post_send", region=Region(rect.left, rect.top, rect.width, rect.height))
-                is_capture_evidence = getattr(self.screen, "is_capture_evidence", None)
-                evidence_ok = bool(is_capture_evidence(evidence)) if callable(is_capture_evidence) else evidence.suffix.lower() == ".png"
-                if not evidence_ok:
-                    raise RuntimeError("发送后截图证据不可用，无法确认本批发送结果")
-                title_shot = self.screen.save_checkpoint(
-                    f"batch_{batch_no}_post_send_picker_title",
-                    region=self._recipient_picker_title_region(rect),
-                )
-                if self._has_ocr_text(title_shot, ("发送给", "分别发送给")):
-                    raise RuntimeError("发送后仍检测到收件人弹窗，无法确认本批发送结果")
+                self._verify_post_send_result(rect, batch_no)
             picker_open = False
+            self._mark_fast_path_ready(batch_no, rect)
             return effective_count
         except Exception:
             if picker_open:
@@ -422,6 +429,78 @@ class ForwardFlow:
                 else:
                     self._cancel_recipient_picker(rect)
             raise
+
+    def _can_use_fast_path(self, batch_no: int) -> bool:
+        return bool(batch_no > 1 and self._fast_path.ready and self._fast_path.window_rect is not None)
+
+    def _locate_or_reuse_window(self, batch_no: int) -> WindowRect | None:
+        if self._can_use_fast_path(batch_no):
+            rect = self._fast_path.window_rect
+            log.info("快速模式：复用第一批企业微信窗口位置：batch=%s rect=%s", batch_no, rect)
+            self._activate_window_for_capture()
+            return rect
+        rect = self.window.locate()
+        if rect is not None:
+            self._fast_path.window_rect = rect
+            log.info("记录企业微信窗口位置供后续快速模式复用：batch=%s rect=%s", batch_no, rect)
+        return rect
+
+    def _mark_fast_path_ready(self, batch_no: int, rect: WindowRect) -> None:
+        if batch_no != 1 or self.boundary_reached:
+            return
+        if self._fast_path.window_rect is None:
+            self._fast_path.window_rect = rect
+        missing = []
+        if not self._fast_path.recipient_checkbox_points_bottom_to_top:
+            missing.append("recipient_checkbox_points")
+        if self._fast_path.recipient_scroll_drag is None or self._fast_path.recipient_scroll_track is None:
+            missing.append("recipient_scroll")
+        if self._fast_path.final_send_button_ratio is None:
+            missing.append("final_send_button")
+        if missing:
+            log.warning("快速模式未启用：第一批缺少缓存项 batch=%s missing=%s", batch_no, missing)
+            return
+        self._fast_path.ready = True
+        log.info(
+            "快速模式已启用：后续批次将复用第一批坐标 rect=%s recipient_points=%s scroll_drag=%s scroll_track=%s final_send_button=%s",
+            self._fast_path.window_rect,
+            [(round(x, 3), round(y, 3)) for x, y in self._fast_path.recipient_checkbox_points_bottom_to_top],
+            self._fast_path.recipient_scroll_drag,
+            self._fast_path.recipient_scroll_track,
+            tuple(round(value, 3) for value in self._fast_path.final_send_button_ratio),
+        )
+
+    def _verify_post_send_result(self, rect: WindowRect, batch_no: int) -> None:
+        if self._can_use_fast_path(batch_no):
+            self._activate_window_for_capture()
+            evidence = self.screen.save_checkpoint(
+                f"batch_{batch_no}_post_send_picker_title_fast",
+                region=self._recipient_picker_title_region(rect),
+            )
+            is_capture_evidence = getattr(self.screen, "is_capture_evidence", None)
+            evidence_ok = bool(is_capture_evidence(evidence)) if callable(is_capture_evidence) else evidence.suffix.lower() == ".png"
+            if not evidence_ok:
+                raise RuntimeError("发送后局部截图证据不可用，无法确认本批发送结果")
+            log.info("快速模式：发送后仅保存弹窗标题区域作为关闭证据，跳过 OCR 复查：batch=%s screenshot=%s", batch_no, evidence)
+            return
+
+        evidence = self.screen.save_checkpoint(f"batch_{batch_no}_post_send", region=Region(rect.left, rect.top, rect.width, rect.height))
+        is_capture_evidence = getattr(self.screen, "is_capture_evidence", None)
+        evidence_ok = bool(is_capture_evidence(evidence)) if callable(is_capture_evidence) else evidence.suffix.lower() == ".png"
+        if not evidence_ok:
+            raise RuntimeError("发送后截图证据不可用，无法确认本批发送结果")
+        title_shot = self.screen.save_checkpoint(
+            f"batch_{batch_no}_post_send_picker_title",
+            region=self._recipient_picker_title_region(rect),
+        )
+        if self._has_ocr_text(title_shot, ("发送给", "分别发送给")):
+            raise RuntimeError("发送后仍检测到收件人弹窗，无法确认本批发送结果")
+        wide_title_shot = self.screen.save_checkpoint(
+            f"batch_{batch_no}_post_send_picker_title_wide",
+            region=self._recipient_picker_wide_region(rect),
+        )
+        if self._has_ocr_text(wide_title_shot, ("发送给", "分别发送给")):
+            raise RuntimeError("发送后宽区域仍检测到收件人弹窗，无法确认本批发送结果")
 
     def _open_recipient_picker_from_source(self, rect: WindowRect, batch_no: int) -> None:
         started = time.monotonic()
@@ -447,33 +526,91 @@ class ForwardFlow:
 
         started = time.monotonic()
         log.info("开始等待发送给弹窗出现：batch=%s", batch_no)
-        picker_shot = None
-        for attempt in range(1, 4):
-            self._sleep(0.20 if attempt == 1 else 0.15)
+        if self._can_use_fast_path(batch_no):
+            self._sleep(0.35)
             picker_shot = self.screen.save_checkpoint(
-                f"batch_{batch_no}_recipient_picker_opened_attempt_{attempt}",
+                f"batch_{batch_no}_recipient_picker_opened_fast",
                 region=self._recipient_picker_title_region(rect),
             )
+            log.info(
+                "快速模式：复用第一批弹窗位置，跳过发送给标题 OCR：batch=%s screenshot=%s elapsed=%.2fs",
+                batch_no,
+                picker_shot,
+                time.monotonic() - started,
+            )
+            return
+        picker_shot = self._wait_for_recipient_picker_title(
+            rect,
+            batch_no,
+            prefix="attempt",
+            attempts=3,
+            started=started,
+        )
+        if picker_shot is not None:
+            return
+        picker_shot = getattr(self, "_last_recipient_picker_probe", picker_shot)
+        elapsed = time.monotonic() - started
+        log.error("发送给弹窗识别失败：batch=%s screenshot=%s elapsed=%.2fs", batch_no, picker_shot, elapsed)
+        raise RuntimeError(f"点击逐条转发后未识别到发送给弹窗，已停止以避免误点会话列表。screenshot={picker_shot}")
+
+    def _wait_for_recipient_picker_title(
+        self,
+        rect: WindowRect,
+        batch_no: int,
+        *,
+        prefix: str,
+        attempts: int,
+        started: float,
+    ):
+        picker_shot = None
+        for attempt in range(1, attempts + 1):
+            self._sleep(0.20 if attempt == 1 else 0.15)
+            suffix = f"attempt_{attempt}" if prefix == "attempt" else f"{prefix}_attempt_{attempt}"
+            picker_shot = self.screen.save_checkpoint(
+                f"batch_{batch_no}_recipient_picker_opened_{suffix}",
+                region=self._recipient_picker_title_region(rect),
+            )
+            self._last_recipient_picker_probe = picker_shot
             if self._has_ocr_text(picker_shot, ("发送给", "分别发送给")):
                 elapsed = time.monotonic() - started
                 log.info(
                     "发送给弹窗识别完成：batch=%s attempt=%s screenshot=%s elapsed=%.2fs",
                     batch_no,
-                    attempt,
+                    suffix,
                     picker_shot,
                     elapsed,
                 )
-                return
+                return picker_shot
             log.info(
                 "发送给弹窗尚未识别到：batch=%s attempt=%s screenshot=%s elapsed=%.2fs",
                 batch_no,
-                attempt,
+                suffix,
                 picker_shot,
                 time.monotonic() - started,
             )
-        elapsed = time.monotonic() - started
-        log.error("发送给弹窗识别失败：batch=%s screenshot=%s elapsed=%.2fs", batch_no, picker_shot, elapsed)
-        raise RuntimeError(f"点击逐条转发后未识别到发送给弹窗，已停止以避免误点会话列表。screenshot={picker_shot}")
+            wide_shot = self.screen.save_checkpoint(
+                f"batch_{batch_no}_recipient_picker_opened_{suffix}_wide",
+                region=self._recipient_picker_wide_region(rect),
+            )
+            self._last_recipient_picker_probe = wide_shot
+            if self._has_ocr_text(wide_shot, ("发送给", "分别发送给")):
+                elapsed = time.monotonic() - started
+                log.info(
+                    "发送给弹窗宽区域识别完成：batch=%s attempt=%s screenshot=%s elapsed=%.2fs",
+                    batch_no,
+                    suffix,
+                    wide_shot,
+                    elapsed,
+                )
+                return wide_shot
+            log.info(
+                "发送给弹窗宽区域仍未识别到：batch=%s attempt=%s screenshot=%s elapsed=%.2fs",
+                batch_no,
+                suffix,
+                wide_shot,
+                time.monotonic() - started,
+            )
+        return None
 
     def _recipient_checkbox_x_ratio(self, rect: WindowRect) -> float:
         if self._last_recipient_checkbox_x_ratio is not None:
@@ -490,11 +627,24 @@ class ForwardFlow:
             height=round(rect.height * 0.145),
         )
 
+    def _recipient_picker_wide_region(self, rect: WindowRect) -> Region:
+        return Region(
+            left=rect.left + round(rect.width * 0.260),
+            top=rect.top + round(rect.height * 0.090),
+            width=round(rect.width * 0.520),
+            height=round(rect.height * 0.720),
+        )
+
     def _click_final_send_button(self, rect: WindowRect) -> bool:
-        detected = self._detect_final_send_button_ratio(rect)
+        detected = self._fast_path.final_send_button_ratio
+        if detected is not None and self._fast_path.ready:
+            log.info("快速模式：复用第一批最终发送按钮坐标：ratio=(%.3f, %.3f)", detected[0], detected[1])
+        else:
+            detected = self._detect_final_send_button_ratio(rect)
         if detected is None:
             log.error("未能识别最终发送按钮，已停止避免误点：rect=%s", rect)
             return False
+        self._fast_path.final_send_button_ratio = detected
         send_x, send_y = detected
         click_x, click_y = rect.relative_point(send_x, send_y)
         log.info(
@@ -510,12 +660,67 @@ class ForwardFlow:
         return bool(self.window.click_relative(rect, send_x, send_y))
 
     def _detect_final_send_button_ratio(self, rect: WindowRect) -> tuple[float, float] | None:
-        image_path = self._save_window_checkpoint("final_send_button_probe", rect)
+        region = self._final_send_button_region(rect)
+        self._activate_window_for_capture()
+        region_path = self.screen.save_checkpoint("final_send_button_probe_region", region=region)
         size_getter = getattr(self.screen, "image_size", None)
+        region_size = size_getter(region_path) if callable(size_getter) else None
+        if not region_size or region_size[0] <= 0 or region_size[1] <= 0:
+            region_size = (region.width, region.height)
+        region_ratio = (
+            (region.left - rect.left) / rect.width,
+            (region.top - rect.top) / rect.height,
+            region.width / rect.width,
+            region.height / rect.height,
+        )
+        detected = self._detect_final_send_button_ratio_in_image(
+            region_path,
+            region_size,
+            window_region_ratio=region_ratio,
+            blue_search_region_ratio=(0.0, 0.0, 1.0, 1.0),
+        )
+        if detected is not None:
+            log.info(
+                "通过发送按钮局部区域识别到最终发送按钮：region=%s ratio=(%.3f, %.3f)",
+                region,
+                detected[0],
+                detected[1],
+            )
+            return detected
+        log.warning("局部区域未识别到最终发送按钮，回退整窗识别：region=%s screenshot=%s", region, region_path)
+
+        image_path = self._save_window_checkpoint("final_send_button_probe", rect)
         image_size = size_getter(image_path) if callable(size_getter) else None
         if not image_size or image_size[0] <= 0 or image_size[1] <= 0:
             image_size = (rect.width, rect.height)
+        return self._detect_final_send_button_ratio_in_image(
+            image_path,
+            image_size,
+            window_region_ratio=(0.0, 0.0, 1.0, 1.0),
+            blue_search_region_ratio=(0.35, 0.55, 0.40, 0.35),
+        )
+
+    def _final_send_button_region(self, rect: WindowRect) -> Region:
+        return Region(
+            left=rect.left + round(rect.width * 0.420),
+            top=rect.top + round(rect.height * 0.660),
+            width=round(rect.width * 0.300),
+            height=round(rect.height * 0.220),
+        )
+
+    def _detect_final_send_button_ratio_in_image(
+        self,
+        image_path,
+        image_size: tuple[int, int],
+        *,
+        window_region_ratio: tuple[float, float, float, float],
+        blue_search_region_ratio: tuple[float, float, float, float],
+    ) -> tuple[float, float] | None:
+        size_getter = getattr(self.screen, "image_size", None)
         image_width, image_height = image_size
+        if image_width <= 0 or image_height <= 0:
+            return None
+        offset_x, offset_y, width_ratio, height_ratio = window_region_ratio
 
         try:
             lines = self.screen.ocr_lines(image_path=image_path)
@@ -534,8 +739,10 @@ class ForwardFlow:
                 priority = 1
             else:
                 continue
-            center_x = (line.left + line.width / 2.0) / image_width
-            center_y = (line.top + line.height / 2.0) / image_height
+            local_x = (line.left + line.width / 2.0) / image_width
+            local_y = (line.top + line.height / 2.0) / image_height
+            center_x = offset_x + local_x * width_ratio
+            center_y = offset_y + local_y * height_ratio
             if 0.35 <= center_x <= 0.75 and 0.55 <= center_y <= 0.90:
                 candidates.append((priority, center_x, center_y, line.text))
         if candidates:
@@ -547,12 +754,25 @@ class ForwardFlow:
             log.info("识别到最终发送按钮：text=%s ratio=(%.3f, %.3f)", text, x_ratio, y_ratio)
             return (x_ratio, y_ratio)
 
-        button = self._detect_blue_final_send_button_ratio(image_path, image_size)
+        button = self._detect_blue_final_send_button_ratio(
+            image_path,
+            image_size,
+            search_region_ratio=blue_search_region_ratio,
+        )
         if button is not None:
-            log.info("通过蓝色按钮区域识别到最终发送按钮：ratio=(%.3f, %.3f)", button[0], button[1])
-        return button
+            x_ratio = offset_x + button[0] * width_ratio
+            y_ratio = offset_y + button[1] * height_ratio
+            log.info("通过蓝色按钮区域识别到最终发送按钮：ratio=(%.3f, %.3f)", x_ratio, y_ratio)
+            return (x_ratio, y_ratio)
+        return None
 
-    def _detect_blue_final_send_button_ratio(self, image_path, image_size: tuple[int, int]) -> tuple[float, float] | None:
+    def _detect_blue_final_send_button_ratio(
+        self,
+        image_path,
+        image_size: tuple[int, int],
+        *,
+        search_region_ratio: tuple[float, float, float, float],
+    ) -> tuple[float, float] | None:
         try:
             import cv2  # type: ignore
             import numpy as np  # type: ignore
@@ -566,10 +786,11 @@ class ForwardFlow:
         image_width, image_height = image_size
         if image_width <= 0 or image_height <= 0:
             return None
-        roi_left = round(image_width * 0.35)
-        roi_top = round(image_height * 0.55)
-        roi_right = round(image_width * 0.75)
-        roi_bottom = round(image_height * 0.90)
+        search_x, search_y, search_width, search_height = search_region_ratio
+        roi_left = round(image_width * search_x)
+        roi_top = round(image_height * search_y)
+        roi_right = round(image_width * (search_x + search_width))
+        roi_bottom = round(image_height * (search_y + search_height))
         roi = bitmap[roi_top:roi_bottom, roi_left:roi_right]
         if roi.size == 0:
             return None
@@ -646,6 +867,26 @@ class ForwardFlow:
         if not callable(drag_screen):
             raise RuntimeError("当前环境不支持拖动收件人列表滚动条，已停止避免未到底就选择会话")
 
+        if self._can_use_fast_path(batch_no) and self._fast_path.recipient_scroll_drag is not None:
+            drag_start, drag_end = self._fast_path.recipient_scroll_drag
+            track = self._fast_path.recipient_scroll_track or (click_x, click_y)
+            log.info(
+                "快速模式：复用第一批收件人滚动条坐标：batch=%s drag_start=%s drag_end=%s track=%s",
+                batch_no,
+                drag_start,
+                drag_end,
+                track,
+            )
+            if not drag_screen(*drag_start, *drag_end, duration=0.25):
+                raise RuntimeError(f"快速模式拖动收件人滚动条失败：batch={batch_no} start={drag_start} end={drag_end}")
+            self._sleep(0.10)
+            if not self.window.click_screen(*track):
+                raise RuntimeError(f"快速模式点击收件人滚动条底部轨道失败：batch={batch_no} abs={track}")
+            self._sleep(0.08)
+            screenshot = self._save_recipient_list_checkpoint(f"batch_{batch_no}_recipient_scroll_fast", rect)
+            log.info("快速模式：收件人列表滚动到底部完成：batch=%s screenshot=%s", batch_no, screenshot)
+            return
+
         for attempt, (drag_start, drag_end) in enumerate(drag_candidates, start=1):
             log.info(
                 "尝试拖动收件人滚动条：batch=%s attempt=%s start=%s end=%s",
@@ -679,6 +920,7 @@ class ForwardFlow:
             )
             previous_path = dragged_path
             if moved:
+                self._fast_path.recipient_scroll_drag = (drag_start, drag_end)
                 break
 
         if not moved:
@@ -732,6 +974,7 @@ class ForwardFlow:
             )
             previous_path = current_path
             if moved and stable_rounds >= 2:
+                self._fast_path.recipient_scroll_track = (click_x, click_y)
                 log.info(
                     "收件人列表已确认滚动到底部：batch=%s method=drag_then_verify moved=%s rounds=%s screenshot=%s",
                     batch_no,
@@ -788,6 +1031,15 @@ class ForwardFlow:
             f"batch_{batch_no}_recipient_picker_{stage}",
             region=self._recipient_picker_title_region(rect),
         )
+        if self._can_use_fast_path(batch_no):
+            log.info(
+                "快速模式：复用第一批弹窗位置，跳过收件人弹窗 OCR 复核：batch=%s stage=%s screenshot=%s elapsed=%.2fs",
+                batch_no,
+                stage,
+                image_path,
+                time.monotonic() - started,
+            )
+            return
         if self._has_ocr_text(image_path, ("发送给", "分别发送给")):
             log.info(
                 "收件人弹窗复核通过：batch=%s stage=%s screenshot=%s elapsed=%.2fs",
@@ -797,20 +1049,33 @@ class ForwardFlow:
                 time.monotonic() - started,
             )
             return
+        wide_image_path = self.screen.save_checkpoint(
+            f"batch_{batch_no}_recipient_picker_{stage}_wide",
+            region=self._recipient_picker_wide_region(rect),
+        )
+        if self._has_ocr_text(wide_image_path, ("发送给", "分别发送给")):
+            log.info(
+                "收件人弹窗宽区域复核通过：batch=%s stage=%s screenshot=%s elapsed=%.2fs",
+                batch_no,
+                stage,
+                wide_image_path,
+                time.monotonic() - started,
+            )
+            return
         log.error(
             "收件人弹窗复核失败：batch=%s stage=%s screenshot=%s elapsed=%.2fs",
             batch_no,
             stage,
-            image_path,
+            wide_image_path,
             time.monotonic() - started,
         )
-        raise RuntimeError(f"收件人弹窗在 {stage} 阶段未保持在前台或未识别到，已停止以避免误点。screenshot={image_path}")
+        raise RuntimeError(f"收件人弹窗在 {stage} 阶段未保持在前台或未识别到，已停止以避免误点。screenshot={wide_image_path}")
 
     def _recipient_checkbox_rows_bottom_to_top(self, selected_count: int, rect: WindowRect | None = None) -> list[float]:
         if selected_count <= 0:
             return []
         if rect is not None and rect.width >= 1600:
-            checkbox_y_top_to_bottom = [0.368, 0.426, 0.485, 0.543, 0.602, 0.660, 0.718, 0.777]
+            checkbox_y_top_to_bottom = [0.285, 0.358, 0.432, 0.506, 0.580, 0.654, 0.728, 0.802, 0.876]
         else:
             checkbox_y_top_to_bottom = [0.319, 0.382, 0.445, 0.507, 0.569, 0.632, 0.694, 0.757, 0.819]
         if selected_count < self.config.batch_size:
@@ -824,6 +1089,16 @@ class ForwardFlow:
     ) -> list[tuple[float, float]]:
         if selected_count <= 0:
             return []
+        cached = self._fast_path.recipient_checkbox_points_bottom_to_top
+        if self._can_use_fast_path(batch_no) and cached and len(cached) >= selected_count:
+            selected = cached[:selected_count]
+            log.info(
+                "快速模式：复用第一批收件人复选框坐标：batch=%s count=%s points=%s",
+                batch_no,
+                selected_count,
+                [(round(x, 3), round(y, 3)) for x, y in selected],
+            )
+            return selected
         image_path = self._save_window_checkpoint(f"batch_{batch_no}_recipient_checkbox_candidates", rect)
         find_outlines = getattr(self.screen, "find_checkbox_outline_ratios", None)
         min_x, max_x = self._recipient_checkbox_x_bounds(rect)
@@ -865,6 +1140,8 @@ class ForwardFlow:
 
         selected = sorted(candidates, key=lambda point: point[1], reverse=True)[:selected_count]
         self._last_recipient_checkbox_x_ratio = sum(x for x, _y in selected) / len(selected)
+        if selected_count == self.config.batch_size or not self._fast_path.recipient_checkbox_points_bottom_to_top:
+            self._fast_path.recipient_checkbox_points_bottom_to_top = list(selected)
         log.info("将从底部往上勾选收件人坐标：%s", [(round(x, 3), round(y, 3)) for x, y in selected])
         return selected
 
@@ -890,7 +1167,7 @@ class ForwardFlow:
 
     def _recipient_checkbox_y_bounds(self, rect: WindowRect) -> tuple[float, float]:
         if rect.width >= 1600:
-            return (0.330, 0.835)
+            return (0.270, 0.900)
         return (0.290, 0.870)
 
     def _dedupe_recipient_checkbox_points(self, points: list[tuple[float, float]]) -> list[tuple[float, float]]:
@@ -965,10 +1242,10 @@ class ForwardFlow:
     def _left_candidate_region(self, rect: WindowRect) -> Region:
         if rect.width >= 1600:
             return Region(
-                left=rect.left + round(rect.width * 0.285),
-                top=rect.top + round(rect.height * 0.310),
-                width=round(rect.width * 0.210),
-                height=round(rect.height * 0.540),
+                left=rect.left + round(rect.width * 0.255),
+                top=rect.top + round(rect.height * 0.260),
+                width=round(rect.width * 0.245),
+                height=round(rect.height * 0.650),
             )
         return Region(
             left=rect.left + round(rect.width * 0.200),

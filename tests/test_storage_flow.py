@@ -7,7 +7,7 @@ from PIL import Image, ImageDraw
 
 from wecom_rpa.config import AppConfig, RecipientSelectionConfig, SentinelConfig
 from wecom_rpa.forward_flow import ForwardFlow, SelectedRecipient
-from wecom_rpa.screen import OcrLine
+from wecom_rpa.screen import OcrLine, Region
 from wecom_rpa.wecom_window import WindowRect
 
 
@@ -136,27 +136,152 @@ class ForwardFlowTest(unittest.TestCase):
     def test_final_send_button_uses_ocr_detected_button_location(self):
         with tempfile.TemporaryDirectory() as d:
             flow = ForwardFlow(AppConfig(), screenshot_dir=d, install_stop_hotkey=False)
+            rect = WindowRect(-2, -2, 2564, 1384)
+            region = flow._final_send_button_region(rect)
 
             class FakeScreen:
-                def save_checkpoint(self, *_args, **_kwargs):
-                    return Path(d) / "send_button.png"
+                def __init__(self):
+                    self.saved_regions = []
+
+                def save_checkpoint(self, *_args, **kwargs):
+                    self.saved_regions.append(kwargs.get("region"))
+                    return Path(d) / "send_button_region.png"
 
                 def ocr_lines(self, *, image_path):
                     return [
-                        OcrLine("分别发送给", 1309, 378, 91, 30),
-                        OcrLine("分别发送", 1357, 976, 75, 35),
-                        OcrLine("取消", 1549, 979, 40, 27),
+                        OcrLine("分别发送", 280, 120, 75, 35),
+                        OcrLine("取消", 470, 120, 40, 27),
                     ]
 
                 def image_size(self, _image_path):
+                    return (region.width, region.height)
+
+            fake_screen = FakeScreen()
+            flow.screen = fake_screen
+
+            ratio = flow._detect_final_send_button_ratio(rect)
+
+            expected_x = ((region.left - rect.left) + 280 + 75 / 2) / rect.width
+            expected_y = ((region.top - rect.top) + 120 + 35 / 2) / rect.height
+            self.assertAlmostEqual(ratio[0], expected_x, places=3)
+            self.assertAlmostEqual(ratio[1], expected_y, places=3)
+            self.assertEqual(fake_screen.saved_regions, [region])
+
+    def test_final_send_button_falls_back_to_full_window_when_region_misses(self):
+        with tempfile.TemporaryDirectory() as d:
+            flow = ForwardFlow(AppConfig(), screenshot_dir=d, install_stop_hotkey=False)
+            rect = WindowRect(-2, -2, 2564, 1384)
+
+            class FakeScreen:
+                def __init__(self):
+                    self.saved_regions = []
+                    self.calls = 0
+
+                def save_checkpoint(self, *_args, **kwargs):
+                    self.saved_regions.append(kwargs.get("region"))
+                    self.calls += 1
+                    path = Path(d) / f"send_button_{self.calls}.png"
+                    Image.new("RGB", (200, 120), "white").save(path)
+                    return path
+
+                def ocr_lines(self, *, image_path):
+                    if image_path.name == "send_button_1.png":
+                        return []
+                    return [
+                        OcrLine("分别发送给", 1309, 378, 91, 30),
+                        OcrLine("分别发送", 1357, 976, 75, 35),
+                    ]
+
+                def image_size(self, image_path):
+                    if image_path.name == "send_button_1.png":
+                        region = flow._final_send_button_region(rect)
+                        return (region.width, region.height)
                     return (2564, 1384)
 
-            flow.screen = FakeScreen()
+            fake_screen = FakeScreen()
+            flow.screen = fake_screen
 
-            ratio = flow._detect_final_send_button_ratio(WindowRect(-2, -2, 2564, 1384))
+            ratio = flow._detect_final_send_button_ratio(rect)
 
             self.assertAlmostEqual(ratio[0], (1357 + 75 / 2) / 2564, places=3)
             self.assertAlmostEqual(ratio[1], (976 + 35 / 2) / 1384, places=3)
+            self.assertEqual(fake_screen.saved_regions[0], flow._final_send_button_region(rect))
+            self.assertEqual(fake_screen.saved_regions[1], Region(rect.left, rect.top, rect.width, rect.height))
+
+    def test_fast_path_reuses_cached_window_rect_after_first_batch(self):
+        flow = ForwardFlow(AppConfig(), install_stop_hotkey=False)
+        rect = WindowRect(10, 20, 1600, 900)
+        flow._fast_path.ready = True
+        flow._fast_path.window_rect = rect
+        flow.window.locate = mock.Mock(side_effect=AssertionError("should not locate again"))
+        flow.window.activate = mock.Mock(return_value=True)
+        flow._sleep = mock.Mock()
+
+        self.assertEqual(flow._locate_or_reuse_window(2), rect)
+        flow.window.locate.assert_not_called()
+
+    def test_fast_path_reuses_cached_recipient_checkbox_points(self):
+        flow = ForwardFlow(AppConfig(), install_stop_hotkey=False)
+        flow._fast_path.ready = True
+        flow._fast_path.window_rect = WindowRect(0, 0, 1600, 900)
+        flow._fast_path.recipient_checkbox_points_bottom_to_top = [
+            (0.30, 0.80),
+            (0.30, 0.74),
+            (0.30, 0.68),
+        ]
+        flow._save_window_checkpoint = mock.Mock(side_effect=AssertionError("should not scan checkboxes again"))
+
+        selected = flow._recipient_checkbox_points_bottom_to_top(2, flow._fast_path.window_rect, 2)
+
+        self.assertEqual(selected, [(0.30, 0.80), (0.30, 0.74)])
+        flow._save_window_checkpoint.assert_not_called()
+
+    def test_fast_path_reuses_cached_final_send_button(self):
+        flow = ForwardFlow(AppConfig(), install_stop_hotkey=False)
+        rect = WindowRect(0, 0, 1600, 900)
+        flow._fast_path.ready = True
+        flow._fast_path.final_send_button_ratio = (0.56, 0.78)
+        flow._detect_final_send_button_ratio = mock.Mock(side_effect=AssertionError("should not run OCR again"))
+        flow.window.click_screen = mock.Mock(return_value=True)
+
+        self.assertTrue(flow._click_final_send_button(rect))
+
+        flow._detect_final_send_button_ratio.assert_not_called()
+        flow.window.click_screen.assert_called_once_with(*rect.relative_point(0.56, 0.78))
+
+    def test_recipient_picker_open_detection_falls_back_to_wide_region(self):
+        with tempfile.TemporaryDirectory() as d:
+            flow = ForwardFlow(AppConfig(), screenshot_dir=d, install_stop_hotkey=False)
+            rect = WindowRect(0, 0, 1600, 900)
+            flow._sleep = mock.Mock()
+
+            class FakeScreen:
+                def __init__(self):
+                    self.saved_regions = []
+
+                def save_checkpoint(self, name, *, region=None):
+                    self.saved_regions.append(region)
+                    path = Path(d) / f"{name}.png"
+                    Image.new("RGB", (120, 60), "white").save(path)
+                    return path
+
+                def ocr_lines(self, *, image_path):
+                    if image_path.name.endswith("_wide.png"):
+                        return [OcrLine("发送给", 10, 10, 40, 20)]
+                    return []
+
+            class FakeWindow:
+                def click_relative(self, *_args):
+                    return True
+
+            fake_screen = FakeScreen()
+            flow.screen = fake_screen
+            flow.window = FakeWindow()
+
+            flow._open_recipient_picker_from_source(rect, 1)
+
+            self.assertIn(flow._recipient_picker_title_region(rect), fake_screen.saved_regions)
+            self.assertIn(flow._recipient_picker_wide_region(rect), fake_screen.saved_regions)
 
     def test_recipient_list_image_difference_detects_movement_and_stability(self):
         with tempfile.TemporaryDirectory() as d:
@@ -312,6 +437,30 @@ class ForwardFlowTest(unittest.TestCase):
         self.assertLess(region[1], 0.330)
         self.assertGreater(region[0] + region[2], 0.330)
         self.assertGreater(region[1] + region[3], 0.835)
+
+    def test_wide_recipient_checkbox_bounds_include_nine_visible_rows(self):
+        flow = ForwardFlow(AppConfig(), install_stop_hotkey=False)
+        rect = WindowRect(-3, -3, 1926, 1014)
+
+        min_y, max_y = flow._recipient_checkbox_y_bounds(rect)
+        rows = flow._recipient_checkbox_rows_bottom_to_top(9, rect)
+
+        self.assertLessEqual(min_y, 0.285)
+        self.assertGreaterEqual(max_y, 0.876)
+        self.assertEqual(len(rows), 9)
+        self.assertAlmostEqual(rows[0], 0.876, places=3)
+        self.assertAlmostEqual(rows[-1], 0.285, places=3)
+
+    def test_left_candidate_region_includes_selected_checkbox_column_and_rows(self):
+        flow = ForwardFlow(AppConfig(), install_stop_hotkey=False)
+        rect = WindowRect(-3, -3, 1926, 1014)
+        region = flow._left_candidate_region(rect)
+        checkbox_x = rect.left + rect.width * 0.275
+
+        self.assertLessEqual(region.left, checkbox_x)
+        self.assertGreaterEqual(region.left + region.width, rect.left + rect.width * 0.430)
+        self.assertLessEqual(region.top, rect.top + rect.height * 0.285)
+        self.assertGreaterEqual(region.top + region.height, rect.top + rect.height * 0.876)
 
 
 if __name__ == "__main__":
