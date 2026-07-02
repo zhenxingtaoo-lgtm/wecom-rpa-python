@@ -814,17 +814,114 @@ class ForwardFlow:
 
     def _recipient_scrollbar_track_point(self, rect: WindowRect) -> tuple[float, float]:
         if rect.width >= 1600:
-            return (0.494, 0.810)
-        return (0.492, 0.820)
+            return (0.494, self._recipient_scrollbar_track_bottom_ratio(rect))
+        return (0.492, self._recipient_scrollbar_track_bottom_ratio(rect))
+
+    def _recipient_scrollbar_track_bottom_ratio(self, rect: WindowRect) -> float:
+        if rect.width >= 1600:
+            return 0.855
+        return 0.850
+
+    def _recipient_scrollbar_thumb_at_bottom(
+        self,
+        thumb: tuple[float, float, float] | None,
+        rect: WindowRect,
+    ) -> bool:
+        if thumb is None:
+            return False
+        _x_ratio, _top_ratio, bottom_ratio = thumb
+        return bottom_ratio >= self._recipient_scrollbar_track_bottom_ratio(rect) - 0.010
+
+    def _detect_recipient_scrollbar_thumb(
+        self,
+        image_path,
+        rect: WindowRect,
+    ) -> tuple[float, float, float] | None:
+        try:
+            import cv2  # type: ignore
+            import numpy as np  # type: ignore
+        except Exception as exc:
+            log.debug("OpenCV/NumPy 不可用，跳过收件人滚动条滑块识别：%s", exc)
+            return None
+
+        bitmap = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+        if bitmap is None:
+            return None
+        image_height, image_width = bitmap.shape[:2]
+        if image_width <= 0 or image_height <= 0:
+            return None
+
+        track_x_ratio, _track_bottom = self._recipient_scrollbar_track_point(rect)
+        roi_left = max(0, round(image_width * (track_x_ratio - 0.035)))
+        roi_right = min(image_width, round(image_width * (track_x_ratio + 0.035)))
+        roi_top = max(0, round(image_height * 0.200))
+        roi_bottom = min(image_height, round(image_height * 0.900))
+        roi = bitmap[roi_top:roi_bottom, roi_left:roi_right]
+        if roi.size == 0:
+            return None
+
+        blue, green, red = cv2.split(roi)
+        maximum = np.maximum(np.maximum(red, green), blue)
+        minimum = np.minimum(np.minimum(red, green), blue)
+        mask = (
+            (maximum - minimum <= 14)
+            & (red >= 105)
+            & (red <= 205)
+            & (green >= 105)
+            & (green <= 205)
+            & (blue >= 105)
+            & (blue <= 205)
+        ).astype("uint8") * 255
+
+        component_count, _labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        candidates: list[tuple[int, float, float, float]] = []
+        for index in range(1, component_count):
+            left, top, width, height, area = (int(value) for value in stats[index])
+            if area < 40:
+                continue
+            if height < max(24, image_height * 0.018):
+                continue
+            if width < 3 or width > max(36, image_width * 0.025):
+                continue
+            if height < width * 4:
+                continue
+            center_x, _center_y = centroids[index]
+            x_ratio = (roi_left + float(center_x)) / image_width
+            if abs(x_ratio - track_x_ratio) > 0.035:
+                continue
+            top_ratio = (roi_top + top) / image_height
+            bottom_ratio = (roi_top + top + height) / image_height
+            candidates.append((area, x_ratio, top_ratio, bottom_ratio))
+
+        if not candidates:
+            return None
+        _area, x_ratio, top_ratio, bottom_ratio = sorted(candidates, key=lambda item: item[0], reverse=True)[0]
+        return (x_ratio, top_ratio, bottom_ratio)
 
     def _recipient_scrollbar_drag_candidates(
         self,
         rect: WindowRect,
+        thumb: tuple[float, float, float] | None = None,
     ) -> list[tuple[tuple[int, int], tuple[int, int]]]:
+        if thumb is not None:
+            x_ratio, top_ratio, bottom_ratio = thumb
+            height_ratio = max(0.0, bottom_ratio - top_ratio)
+            center_y_ratio = top_ratio + height_ratio / 2.0
+            target_y_ratio = self._recipient_scrollbar_track_bottom_ratio(rect) - height_ratio / 2.0
+            target_y_ratio = min(self._recipient_scrollbar_track_bottom_ratio(rect), max(center_y_ratio, target_y_ratio))
+            return [(rect.relative_point(x_ratio, center_y_ratio), rect.relative_point(x_ratio, target_y_ratio))]
         if rect.width >= 1600:
-            x_ratio, start_y_ratios, end_y_ratio = (0.494, (0.340, 0.360, 0.380), 0.810)
+            x_ratio, start_y_ratios, end_y_ratio = (
+                0.494,
+                (0.285, 0.330, 0.375, 0.420),
+                self._recipient_scrollbar_track_bottom_ratio(rect),
+            )
         else:
-            x_ratio, start_y_ratios, end_y_ratio = (0.492, (0.335, 0.360, 0.385), 0.820)
+            x_ratio, start_y_ratios, end_y_ratio = (
+                0.492,
+                (0.315, 0.360, 0.405),
+                self._recipient_scrollbar_track_bottom_ratio(rect),
+            )
         end = rect.relative_point(x_ratio, end_y_ratio)
         return [(rect.relative_point(x_ratio, start_y), end) for start_y in start_y_ratios]
 
@@ -846,11 +943,27 @@ class ForwardFlow:
         click_x, click_y = rect.relative_point(click_x_ratio, click_y_ratio)
         configured_repeats = self.config.recipient_selection.scroll_to_bottom_repeats
         max_fallback_rounds = min(3, max(1, configured_repeats))
-        drag_candidates = self._recipient_scrollbar_drag_candidates(rect)
         previous_path = self._save_recipient_list_checkpoint(
             f"batch_{batch_no}_recipient_scroll_before",
             rect,
         )
+        scrollbar_probe_path = self._save_window_checkpoint(f"batch_{batch_no}_recipient_scrollbar_before", rect)
+        scrollbar_thumb = self._detect_recipient_scrollbar_thumb(scrollbar_probe_path, rect)
+        if scrollbar_thumb is not None:
+            log.info(
+                "识别到收件人滚动条滑块：batch=%s thumb=%s at_bottom=%s screenshot=%s",
+                batch_no,
+                tuple(round(value, 3) for value in scrollbar_thumb),
+                self._recipient_scrollbar_thumb_at_bottom(scrollbar_thumb, rect),
+                scrollbar_probe_path,
+            )
+        else:
+            log.warning("未识别到收件人滚动条滑块，将使用固定候选拖拽点：batch=%s screenshot=%s", batch_no, scrollbar_probe_path)
+        if self._recipient_scrollbar_thumb_at_bottom(scrollbar_thumb, rect):
+            self._fast_path.recipient_scroll_track = (click_x, click_y)
+            log.info("收件人滚动条滑块已在底部：batch=%s screenshot=%s", batch_no, scrollbar_probe_path)
+            return
+        drag_candidates = self._recipient_scrollbar_drag_candidates(rect, thumb=scrollbar_thumb)
         stable_rounds = 0
         moved = False
 
@@ -903,6 +1016,12 @@ class ForwardFlow:
                 f"batch_{batch_no}_recipient_scroll_after_drag_{attempt}",
                 rect,
             )
+            dragged_scrollbar_path = self._save_window_checkpoint(
+                f"batch_{batch_no}_recipient_scrollbar_after_drag_{attempt}",
+                rect,
+            )
+            dragged_thumb = self._detect_recipient_scrollbar_thumb(dragged_scrollbar_path, rect)
+            dragged_thumb_at_bottom = self._recipient_scrollbar_thumb_at_bottom(dragged_thumb, rect)
             difference = self._recipient_list_image_difference(previous_path, dragged_path)
             if difference is None:
                 raise RuntimeError(
@@ -918,8 +1037,16 @@ class ForwardFlow:
                 moved,
                 dragged_path,
             )
+            log.info(
+                "收件人滚动条滑块复核：batch=%s attempt=%s thumb=%s thumb_at_bottom=%s screenshot=%s",
+                batch_no,
+                attempt,
+                tuple(round(value, 3) for value in dragged_thumb) if dragged_thumb is not None else None,
+                dragged_thumb_at_bottom,
+                dragged_scrollbar_path,
+            )
             previous_path = dragged_path
-            if moved:
+            if moved and (dragged_thumb is None or dragged_thumb_at_bottom):
                 self._fast_path.recipient_scroll_drag = (drag_start, drag_end)
                 break
 
@@ -951,6 +1078,12 @@ class ForwardFlow:
                 f"batch_{batch_no}_recipient_scroll_round_{round_no}",
                 rect,
             )
+            current_scrollbar_path = self._save_window_checkpoint(
+                f"batch_{batch_no}_recipient_scrollbar_round_{round_no}",
+                rect,
+            )
+            current_thumb = self._detect_recipient_scrollbar_thumb(current_scrollbar_path, rect)
+            current_thumb_at_bottom = self._recipient_scrollbar_thumb_at_bottom(current_thumb, rect)
             difference = self._recipient_list_image_difference(previous_path, current_path)
             if difference is None:
                 raise RuntimeError(
@@ -972,9 +1105,19 @@ class ForwardFlow:
                 stable_rounds,
                 current_path,
             )
+            log.info(
+                "收件人滚动条滑块复核：batch=%s round=%s thumb=%s thumb_at_bottom=%s screenshot=%s",
+                batch_no,
+                round_no,
+                tuple(round(value, 3) for value in current_thumb) if current_thumb is not None else None,
+                current_thumb_at_bottom,
+                current_scrollbar_path,
+            )
             previous_path = current_path
-            if moved and stable_rounds >= 2:
+            if moved and stable_rounds >= 2 and (current_thumb is None or current_thumb_at_bottom):
                 self._fast_path.recipient_scroll_track = (click_x, click_y)
+                if self._fast_path.recipient_scroll_drag is None and drag_candidates:
+                    self._fast_path.recipient_scroll_drag = drag_candidates[0]
                 log.info(
                     "收件人列表已确认滚动到底部：batch=%s method=drag_then_verify moved=%s rounds=%s screenshot=%s",
                     batch_no,
@@ -1162,12 +1305,12 @@ class ForwardFlow:
 
     def _recipient_checkbox_x_bounds(self, rect: WindowRect) -> tuple[float, float]:
         if rect.width >= 1600:
-            return (0.260, 0.430)
+            return (0.235, 0.430)
         return (0.200, 0.380)
 
     def _recipient_checkbox_y_bounds(self, rect: WindowRect) -> tuple[float, float]:
         if rect.width >= 1600:
-            return (0.270, 0.900)
+            return (0.265, 0.900)
         return (0.290, 0.870)
 
     def _dedupe_recipient_checkbox_points(self, points: list[tuple[float, float]]) -> list[tuple[float, float]]:

@@ -315,11 +315,42 @@ class ForwardFlowTest(unittest.TestCase):
 
         candidates = flow._recipient_scrollbar_drag_candidates(rect)
 
-        self.assertEqual(len(candidates), 3)
+        self.assertEqual(len(candidates), 4)
         for start, end in candidates:
             self.assertEqual(start[0], end[0])
             self.assertGreater(end[1] - start[1], rect.height // 3)
-            self.assertGreater(start[1], rect.top + rect.height * 0.30)
+            self.assertGreater(start[1], rect.top + rect.height * 0.27)
+
+    def test_detects_recipient_scrollbar_thumb_from_window_screenshot(self):
+        with tempfile.TemporaryDirectory() as d:
+            image_path = Path(d) / "scrollbar.png"
+            image = Image.new("RGB", (1920, 1080), (248, 249, 250))
+            draw = ImageDraw.Draw(image)
+            draw.rounded_rectangle((942, 654, 951, 921), radius=4, fill=(168, 173, 178))
+            image.save(image_path)
+
+            flow = ForwardFlow(AppConfig(), screenshot_dir=d, install_stop_hotkey=False)
+            thumb = flow._detect_recipient_scrollbar_thumb(image_path, WindowRect(0, 0, 1920, 1080))
+
+            self.assertIsNotNone(thumb)
+            assert thumb is not None
+            self.assertAlmostEqual(thumb[0], 946.5 / 1920, places=3)
+            self.assertAlmostEqual(thumb[1], 654 / 1080, places=3)
+            self.assertAlmostEqual(thumb[2], 922 / 1080, places=3)
+
+    def test_recipient_scrollbar_drag_uses_detected_thumb_height_to_reach_bottom(self):
+        flow = ForwardFlow(AppConfig(), install_stop_hotkey=False)
+        rect = WindowRect(0, 0, 1920, 1080)
+        thumb = (0.493, 0.270, 0.300)
+
+        candidates = flow._recipient_scrollbar_drag_candidates(rect, thumb=thumb)
+
+        self.assertEqual(len(candidates), 1)
+        start, end = candidates[0]
+        self.assertEqual(start[0], end[0])
+        self.assertAlmostEqual(start[1], round(rect.height * 0.285), delta=2)
+        self.assertGreater(end[1], round(rect.height * 0.830))
+        self.assertLess(end[1], round(rect.height * 0.860))
 
     def test_source_context_menu_candidates_use_same_message_rows(self):
         flow = ForwardFlow(AppConfig(), install_stop_hotkey=False)
@@ -450,6 +481,18 @@ class ForwardFlowTest(unittest.TestCase):
         self.assertEqual(len(rows), 9)
         self.assertAlmostEqual(rows[0], 0.876, places=3)
         self.assertAlmostEqual(rows[-1], 0.285, places=3)
+
+    def test_wide_recipient_checkbox_bounds_include_1920_150_percent_column(self):
+        flow = ForwardFlow(AppConfig(), install_stop_hotkey=False)
+        rect = WindowRect(0, 0, 1920, 1080)
+
+        min_x, max_x = flow._recipient_checkbox_x_bounds(rect)
+        min_y, max_y = flow._recipient_checkbox_y_bounds(rect)
+
+        self.assertLessEqual(min_x, 0.246)
+        self.assertGreaterEqual(max_x, 0.246)
+        self.assertLessEqual(min_y, 0.269)
+        self.assertGreaterEqual(max_y, 0.825)
 
     def test_left_candidate_region_includes_selected_checkbox_column_and_rows(self):
         flow = ForwardFlow(AppConfig(), install_stop_hotkey=False)
