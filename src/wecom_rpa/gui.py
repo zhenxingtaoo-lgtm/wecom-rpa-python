@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import AppConfig, build_runtime_config
-from .forward_flow import FlowResult, ForwardFlow
+from .forward_flow import FastPathState, FlowResult, ForwardFlow
 from .powershell import terminate_active_powershell
 from .safety import StopController
 from .screen import (
@@ -51,6 +51,7 @@ class RunInspection:
     batch_count: int
     ocr_warning: str | None = None
     source_check: SourceSelectionInspection | None = None
+    preflight_cache: FastPathState | None = None
 
 
 @dataclass(frozen=True)
@@ -153,6 +154,7 @@ def write_run_snapshot(options: GuiRunOptions, inspection: RunInspection) -> Pat
             **asdict(inspection.source_check),
             "screenshot": str(inspection.source_check.screenshot),
         }
+    preflight_cache = asdict(inspection.preflight_cache) if inspection.preflight_cache is not None else None
     payload = {
         "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "log_file": str(options.log_file.resolve()),
@@ -161,6 +163,7 @@ def write_run_snapshot(options: GuiRunOptions, inspection: RunInspection) -> Pat
         "batch_count": inspection.batch_count,
         "effective_config": asdict(inspection.config),
         "source_check": source_check,
+        "preflight_cache": preflight_cache,
     }
     target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     log.info("本次运行参数快照已保存：%s", target)
@@ -692,6 +695,31 @@ class WeComRpaApp:
                     "检查失败：未识别到“逐条转发”按钮，不能继续执行。"
                     f" screenshot={source_check.screenshot}"
                 )
+            preflight_count = min(inspection.config.batch_size, inspection.send_count)
+            self._check_log(
+                "开始检查预演：按正式流程打开会话选择框、滚动到底部、勾选本批会话并识别发送按钮"
+                f" count={preflight_count}",
+                options.log_file,
+            )
+            preflight_flow = ForwardFlow(
+                inspection.config,
+                screenshot_dir=str(options.screenshot_dir),
+                yes=True,
+                real_send_allowed=False,
+                install_stop_hotkey=False,
+            )
+            preflight_started = time.monotonic()
+            preflight_cache = preflight_flow.preflight_first_batch_until_final_send_button(preflight_count)
+            inspection = replace(inspection, preflight_cache=preflight_cache)
+            self._check_log(
+                "检查预演完成："
+                f"elapsed={time.monotonic() - preflight_started:.2f}s "
+                f"recipient_points={[(round(x, 3), round(y, 3)) for x, y in (preflight_cache.recipient_checkbox_points_bottom_to_top or [])]} "
+                f"scroll_drag={preflight_cache.recipient_scroll_drag} "
+                f"scroll_track={preflight_cache.recipient_scroll_track} "
+                f"final_send_button={preflight_cache.final_send_button_ratio}",
+                options.log_file,
+            )
             self.current_inspection = inspection
             self.last_check_passed = True
             self._render_summary(inspection, window_found=window_found)
@@ -794,8 +822,10 @@ class WeComRpaApp:
             return
 
         self.stop_controller = StopController(self.current_inspection.config.stop_hotkey)
+        self.stop_controller.add_callback(terminate_active_powershell)
         self.run_started_at = time.monotonic()
         self._set_running(True)
+        self.progress_var.set(f"运行中；如需立即停止，请按 {self.current_inspection.config.stop_hotkey}")
         self.worker = threading.Thread(target=self._run_worker, args=(options, self.current_inspection, self.stop_controller), daemon=True)
         self.worker.start()
 
@@ -811,16 +841,18 @@ class WeComRpaApp:
                 [round(y, 3) for y in inspection.config.source_selection.checkbox_y_ratios],
                 inspection.send_count,
             )
-            result = ForwardFlow(
+            flow = ForwardFlow(
                 inspection.config,
                 screenshot_dir=str(options.screenshot_dir),
                 yes=False,
                 real_send_allowed=not inspection.config.dry_run,
                 stop_controller=stop_controller,
-                install_stop_hotkey=False,
+                install_stop_hotkey=True,
                 confirm_callback=self._confirm_from_worker,
                 progress_callback=lambda event: self.ui_queue.put(("progress", event)),
-            ).run(inspection.send_count)
+            )
+            flow.apply_preflight_cache(inspection.preflight_cache)
+            result = flow.run(inspection.send_count)
             self.ui_queue.put(("finished", result))
         except Exception as exc:
             self.ui_queue.put(("failed", exc))

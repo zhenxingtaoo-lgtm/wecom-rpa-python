@@ -19,6 +19,15 @@ class SafetyWindowScreenTest(unittest.TestCase):
         stop.reset()
         self.assertFalse(stop.should_stop())
 
+    def test_stop_controller_runs_registered_callbacks(self):
+        callback = mock.Mock()
+        stop = StopController("ctrl+alt+q")
+        stop.add_callback(callback)
+
+        stop.request_stop()
+
+        callback.assert_called_once_with()
+
     def test_send_limit_and_batch_count_validation(self):
         assert_batch_selection_count(9, 9)
         with self.assertRaisesRegex(ValueError, "batch_size"):
@@ -236,6 +245,17 @@ class SafetyWindowScreenTest(unittest.TestCase):
         ), mock.patch.object(window, "_click_point_via_powershell", return_value=True) as powershell_click:
             self.assertTrue(window.click_screen(100, 200))
         powershell_click.assert_not_called()
+
+    def test_move_screen_uses_pyautogui(self):
+        window = WeComWindow("企业微信")
+        fake_pyautogui = mock.Mock()
+
+        with mock.patch.object(window, "_ensure_foreground", return_value=True), mock.patch.dict(
+            "sys.modules", {"pyautogui": fake_pyautogui}
+        ):
+            self.assertTrue(window.move_screen(100, 200))
+
+        fake_pyautogui.moveTo.assert_called_once_with(100, 200, duration=0.05)
 
     def test_drag_uses_pyautogui(self):
         window = WeComWindow("企业微信")

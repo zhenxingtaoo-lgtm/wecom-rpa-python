@@ -53,6 +53,7 @@ class FastPathState:
     recipient_scroll_track: tuple[int, int] | None = None
     final_send_button_ratio: tuple[float, float] | None = None
     ready: bool = False
+    available_from_batch: int = 2
 
 
 class ForwardFlow:
@@ -211,6 +212,110 @@ class ForwardFlow:
             min(self.config.batch_size, send_count - offset)
             for offset in range(0, send_count, self.config.batch_size)
         ]
+
+    def preflight_cache_from_values(
+        self,
+        *,
+        window_rect: WindowRect,
+        recipient_checkbox_points_bottom_to_top: list[tuple[float, float]],
+        recipient_scroll_drag: tuple[tuple[int, int], tuple[int, int]] | None,
+        recipient_scroll_track: tuple[int, int] | None,
+        final_send_button_ratio: tuple[float, float],
+    ) -> FastPathState:
+        return FastPathState(
+            window_rect=window_rect,
+            recipient_checkbox_points_bottom_to_top=list(recipient_checkbox_points_bottom_to_top),
+            recipient_scroll_drag=recipient_scroll_drag,
+            recipient_scroll_track=recipient_scroll_track,
+            final_send_button_ratio=final_send_button_ratio,
+            ready=True,
+            available_from_batch=1,
+        )
+
+    def apply_preflight_cache(self, cache: FastPathState | None) -> None:
+        if cache is None or not cache.ready:
+            return
+        self._fast_path = FastPathState(
+            window_rect=cache.window_rect,
+            recipient_checkbox_points_bottom_to_top=list(cache.recipient_checkbox_points_bottom_to_top or []),
+            recipient_scroll_drag=cache.recipient_scroll_drag,
+            recipient_scroll_track=cache.recipient_scroll_track,
+            final_send_button_ratio=cache.final_send_button_ratio,
+            ready=True,
+            available_from_batch=cache.available_from_batch,
+        )
+        if self._fast_path.recipient_checkbox_points_bottom_to_top:
+            self._last_recipient_checkbox_x_ratio = (
+                sum(x for x, _y in self._fast_path.recipient_checkbox_points_bottom_to_top)
+                / len(self._fast_path.recipient_checkbox_points_bottom_to_top)
+            )
+
+    def export_preflight_cache(self) -> FastPathState:
+        return FastPathState(
+            window_rect=self._fast_path.window_rect,
+            recipient_checkbox_points_bottom_to_top=list(self._fast_path.recipient_checkbox_points_bottom_to_top or []),
+            recipient_scroll_drag=self._fast_path.recipient_scroll_drag,
+            recipient_scroll_track=self._fast_path.recipient_scroll_track,
+            final_send_button_ratio=self._fast_path.final_send_button_ratio,
+            ready=self._fast_path.ready,
+            available_from_batch=self._fast_path.available_from_batch,
+        )
+
+    def preflight_first_batch_until_final_send_button(self, selected_count: int) -> FastPathState:
+        """Run the real first-batch path until the final Send button is recognized, then cancel."""
+        batch_no = 1
+        with self._step("检查预演定位企业微信窗口", batch=batch_no):
+            rect = self._locate_or_reuse_window(batch_no)
+        if rect is None:
+            raise RuntimeError("检查预演需要先找到企业微信窗口")
+        assert_batch_selection_count(selected_count, self.config.batch_size)
+
+        with self._step("检查预演复查源消息勾选", batch=batch_no):
+            self._assert_exact_source_selection(rect, "preflight_source_before_forward")
+
+        with self._step("检查预演打开收件人选择弹窗", batch=batch_no):
+            self._open_recipient_picker_from_source(rect, batch_no)
+
+        picker_open = True
+        try:
+            with self._step("检查预演收件人列表滚动到底部", batch=batch_no):
+                self._scroll_recipient_picker_to_bottom(rect, batch_no, require_scrollbar_thumb=True)
+                self._assert_recipient_picker_still_open(rect, batch_no, "preflight_after_scroll")
+
+            target_checkbox_points = self._recipient_checkbox_points_bottom_to_top(selected_count, rect, batch_no)
+            with self._step("检查预演勾选收件人", batch=batch_no, count=selected_count):
+                for index, (x_ratio, y_ratio) in enumerate(target_checkbox_points, start=1):
+                    if not self._click_recipient_checkbox(rect, x_ratio, y_ratio):
+                        raise RuntimeError(
+                            f"检查预演无法点击第 {index} 个接收会话：ratio=({x_ratio:.3f}, {y_ratio:.3f})"
+                        )
+                    self._sleep(0.12)
+
+                selected_points = self._left_selected_checkbox_y_ratios(
+                    rect,
+                    "preflight_recipients_selected_verify",
+                )
+                if len(selected_points) != selected_count:
+                    raise RuntimeError(
+                        f"检查预演收件人数量复核失败：expected={selected_count} actual={len(selected_points)}"
+                    )
+
+            with self._step("检查预演识别最终发送按钮", batch=batch_no, count=selected_count):
+                final_send_button = self._detect_final_send_button_ratio(rect)
+                if final_send_button is None:
+                    raise RuntimeError("检查预演未识别到会话选择框内的发送按钮")
+                self._fast_path.final_send_button_ratio = final_send_button
+
+            self._fast_path.window_rect = rect
+            self._fast_path.recipient_checkbox_points_bottom_to_top = list(target_checkbox_points)
+            self._fast_path.available_from_batch = 1
+            self._mark_fast_path_ready(batch_no, rect)
+            self._fast_path.ready = True
+            self._fast_path.available_from_batch = 1
+            return self.export_preflight_cache()
+        finally:
+            if picker_open:
+                self._cancel_recipient_picker(rect)
 
     def _run_batch(self, batch_no: int, batch_count: int, *, total_batches: int | None = None) -> int:
         total_batches = self._progress_total_batches if total_batches is None else total_batches
@@ -431,10 +536,14 @@ class ForwardFlow:
             raise
 
     def _can_use_fast_path(self, batch_no: int) -> bool:
-        return bool(batch_no > 1 and self._fast_path.ready and self._fast_path.window_rect is not None)
+        return bool(
+            batch_no >= self._fast_path.available_from_batch
+            and self._fast_path.ready
+            and self._fast_path.window_rect is not None
+        )
 
     def _locate_or_reuse_window(self, batch_no: int) -> WindowRect | None:
-        if self._can_use_fast_path(batch_no):
+        if batch_no > 1 and self._can_use_fast_path(batch_no):
             rect = self._fast_path.window_rect
             log.info("快速模式：复用第一批企业微信窗口位置：batch=%s rect=%s", batch_no, rect)
             self._activate_window_for_capture()
@@ -471,7 +580,7 @@ class ForwardFlow:
         )
 
     def _verify_post_send_result(self, rect: WindowRect, batch_no: int) -> None:
-        if self._can_use_fast_path(batch_no):
+        if batch_no > 1 and self._can_use_fast_path(batch_no):
             self._activate_window_for_capture()
             evidence = self.screen.save_checkpoint(
                 f"batch_{batch_no}_post_send_picker_title_fast",
@@ -526,7 +635,7 @@ class ForwardFlow:
 
         started = time.monotonic()
         log.info("开始等待发送给弹窗出现：batch=%s", batch_no)
-        if self._can_use_fast_path(batch_no):
+        if batch_no > 1 and self._can_use_fast_path(batch_no):
             self._sleep(0.35)
             picker_shot = self.screen.save_checkpoint(
                 f"batch_{batch_no}_recipient_picker_opened_fast",
@@ -937,16 +1046,72 @@ class ForwardFlow:
         self._activate_window_for_capture()
         return self.screen.save_checkpoint(name, region=self._recipient_list_compare_region(rect))
 
-    def _scroll_recipient_picker_to_bottom(self, rect: WindowRect, batch_no: int) -> None:
+    def _recipient_list_hover_point(self, rect: WindowRect) -> tuple[int, int]:
+        x_ratio = 0.365 if rect.width >= 1600 else 0.330
+        return rect.relative_point(x_ratio, 0.560)
+
+    def _reveal_recipient_scrollbar(self, rect: WindowRect, batch_no: int) -> tuple[int, int] | None:
+        hover_x, hover_y = self._recipient_list_hover_point(rect)
+        move_screen = getattr(self.window, "move_screen", None)
+        if not callable(move_screen):
+            log.warning(
+                "Cannot reveal recipient scrollbar because window.move_screen is unavailable: batch=%s hover=(%s, %s)",
+                batch_no,
+                hover_x,
+                hover_y,
+            )
+            return None
+        log.info("Reveal recipient scrollbar by hovering list: batch=%s hover=(%s, %s)", batch_no, hover_x, hover_y)
+        if not move_screen(hover_x, hover_y):
+            log.warning(
+                "Failed to hover recipient list before scrollbar detection: batch=%s hover=(%s, %s)",
+                batch_no,
+                hover_x,
+                hover_y,
+            )
+            return None
+        self._sleep(0.20)
+        return (hover_x, hover_y)
+
+    def _scroll_recipient_picker_to_bottom(
+        self,
+        rect: WindowRect,
+        batch_no: int,
+        *,
+        require_scrollbar_thumb: bool = False,
+    ) -> None:
         """拖动会话列表滚动条到底部，并通过稳定画面确认位置。"""
         click_x_ratio, click_y_ratio = self._recipient_scrollbar_track_point(rect)
         click_x, click_y = rect.relative_point(click_x_ratio, click_y_ratio)
         configured_repeats = self.config.recipient_selection.scroll_to_bottom_repeats
         max_fallback_rounds = min(3, max(1, configured_repeats))
+        drag_screen = getattr(self.window, "drag_screen", None)
+        if self._can_use_fast_path(batch_no) and self._fast_path.recipient_scroll_drag is not None:
+            if not callable(drag_screen):
+                raise RuntimeError("当前环境不支持拖动收件人列表滚动条，已停止避免未到底就选择会话")
+            drag_start, drag_end = self._fast_path.recipient_scroll_drag
+            track = self._fast_path.recipient_scroll_track or (click_x, click_y)
+            log.info(
+                "Fast path: reuse cached recipient scrollbar coordinates: batch=%s drag_start=%s drag_end=%s track=%s",
+                batch_no,
+                drag_start,
+                drag_end,
+                track,
+            )
+            if not drag_screen(*drag_start, *drag_end, duration=0.25):
+                raise RuntimeError(f"快速模式拖动收件人滚动条失败：batch={batch_no} start={drag_start} end={drag_end}")
+            self._sleep(0.10)
+            if not self.window.click_screen(*track):
+                raise RuntimeError(f"快速模式点击收件人滚动条底部轨道失败：batch={batch_no} abs={track}")
+            self._sleep(0.08)
+            screenshot = self._save_recipient_list_checkpoint(f"batch_{batch_no}_recipient_scroll_fast", rect)
+            log.info("Fast path: recipient list scrolled to bottom with cached coordinates: batch=%s screenshot=%s", batch_no, screenshot)
+            return
         previous_path = self._save_recipient_list_checkpoint(
             f"batch_{batch_no}_recipient_scroll_before",
             rect,
         )
+        self._reveal_recipient_scrollbar(rect, batch_no)
         scrollbar_probe_path = self._save_window_checkpoint(f"batch_{batch_no}_recipient_scrollbar_before", rect)
         scrollbar_thumb = self._detect_recipient_scrollbar_thumb(scrollbar_probe_path, rect)
         if scrollbar_thumb is not None:
@@ -958,9 +1123,17 @@ class ForwardFlow:
                 scrollbar_probe_path,
             )
         else:
+            if require_scrollbar_thumb:
+                raise RuntimeError(
+                    "检查环境未识别到会话选择框左侧列表滚动条。请确认发送给弹窗已经打开、鼠标悬停后滚动条可见，"
+                    f"已停止以避免误选。batch={batch_no} screenshot={scrollbar_probe_path}"
+                )
             log.warning("未识别到收件人滚动条滑块，将使用固定候选拖拽点：batch=%s screenshot=%s", batch_no, scrollbar_probe_path)
         if self._recipient_scrollbar_thumb_at_bottom(scrollbar_thumb, rect):
+            drag_candidates = self._recipient_scrollbar_drag_candidates(rect, thumb=scrollbar_thumb)
             self._fast_path.recipient_scroll_track = (click_x, click_y)
+            if drag_candidates:
+                self._fast_path.recipient_scroll_drag = drag_candidates[0]
             log.info("收件人滚动条滑块已在底部：batch=%s screenshot=%s", batch_no, scrollbar_probe_path)
             return
         drag_candidates = self._recipient_scrollbar_drag_candidates(rect, thumb=scrollbar_thumb)
@@ -1114,7 +1287,8 @@ class ForwardFlow:
                 current_scrollbar_path,
             )
             previous_path = current_path
-            if moved and stable_rounds >= 2 and (current_thumb is None or current_thumb_at_bottom):
+            bottom_confirmed = current_thumb is None or current_thumb_at_bottom or scrollbar_thumb is not None
+            if moved and stable_rounds >= 2 and bottom_confirmed:
                 self._fast_path.recipient_scroll_track = (click_x, click_y)
                 if self._fast_path.recipient_scroll_drag is None and drag_candidates:
                     self._fast_path.recipient_scroll_drag = drag_candidates[0]
@@ -1174,7 +1348,7 @@ class ForwardFlow:
             f"batch_{batch_no}_recipient_picker_{stage}",
             region=self._recipient_picker_title_region(rect),
         )
-        if self._can_use_fast_path(batch_no):
+        if batch_no > 1 and self._can_use_fast_path(batch_no):
             log.info(
                 "快速模式：复用第一批弹窗位置，跳过收件人弹窗 OCR 复核：batch=%s stage=%s screenshot=%s elapsed=%.2fs",
                 batch_no,

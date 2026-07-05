@@ -278,6 +278,18 @@ $r = New-Object Win32Rect+RECT
         log.info("点击屏幕坐标：abs=(%s, %s)", x, y)
         return self._click_point_via_pyautogui(x, y) or self._click_point_via_powershell(x, y)
 
+    def move_screen(self, x: int, y: int) -> bool:
+        self._ensure_foreground()
+        log.info("Move cursor to screen point: abs=(%s, %s)", x, y)
+        try:
+            import pyautogui
+
+            pyautogui.moveTo(x, y, duration=0.05)
+            return True
+        except Exception as exc:
+            log.warning("Failed to move cursor: abs=(%s, %s) reason=%s", x, y, exc)
+            return False
+
     def drag_screen(self, start_x: int, start_y: int, end_x: int, end_y: int, *, duration: float = 0.35) -> bool:
         self._ensure_foreground()
         log.info(

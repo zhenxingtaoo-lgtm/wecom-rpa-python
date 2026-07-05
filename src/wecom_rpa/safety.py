@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from typing import Callable
 
 log = logging.getLogger(__name__)
 
@@ -12,13 +13,14 @@ class StopController:
     _stop_requested: bool = False
     _keyboard: object | None = field(default=None, init=False, repr=False)
     _registered: bool = field(default=False, init=False)
+    _callbacks: list[Callable[[], None]] = field(default_factory=list, init=False, repr=False)
 
     def install(self) -> None:
         """注册全局急停热键；依赖不可用时安全降级为手动标记。"""
         try:
             import keyboard  # type: ignore
         except Exception as exc:
-            log.info("急停热键未注册：keyboard 依赖不可用。快捷键配置=%s reason=%s", self.hotkey, exc)
+            log.info("急停热键未注册：keyboard 依赖不可用。hotkey=%s reason=%s", self.hotkey, exc)
             return
 
         try:
@@ -44,12 +46,20 @@ class StopController:
     def request_stop(self) -> None:
         self._stop_requested = True
         log.warning("收到急停请求")
+        for callback in list(self._callbacks):
+            try:
+                callback()
+            except Exception as exc:
+                log.debug("急停回调执行失败：%s", exc)
 
     def should_stop(self) -> bool:
         return self._stop_requested
 
     def reset(self) -> None:
         self._stop_requested = False
+
+    def add_callback(self, callback: Callable[[], None]) -> None:
+        self._callbacks.append(callback)
 
 
 class SendLimitError(ValueError):

@@ -249,6 +249,48 @@ class ForwardFlowTest(unittest.TestCase):
         flow._detect_final_send_button_ratio.assert_not_called()
         flow.window.click_screen.assert_called_once_with(*rect.relative_point(0.56, 0.78))
 
+    def test_preflight_reaches_final_send_button_without_clicking_it_and_caches_coordinates(self):
+        flow = ForwardFlow(AppConfig(), install_stop_hotkey=False)
+        rect = WindowRect(0, 0, 1600, 900)
+        flow._locate_or_reuse_window = mock.Mock(return_value=rect)
+        flow._assert_exact_source_selection = mock.Mock()
+        flow._open_recipient_picker_from_source = mock.Mock()
+        flow._scroll_recipient_picker_to_bottom = mock.Mock()
+        flow._assert_recipient_picker_still_open = mock.Mock()
+        flow._recipient_checkbox_points_bottom_to_top = mock.Mock(return_value=[(0.30, 0.80), (0.30, 0.74)])
+        flow._click_recipient_checkbox = mock.Mock(return_value=True)
+        flow._left_selected_checkbox_y_ratios = mock.Mock(return_value=[0.80, 0.74])
+        flow._detect_final_send_button_ratio = mock.Mock(return_value=(0.56, 0.78))
+        flow._click_final_send_button = mock.Mock(side_effect=AssertionError("preflight must not send"))
+        flow._cancel_recipient_picker = mock.Mock()
+        flow._sleep = mock.Mock()
+
+        cache = flow.preflight_first_batch_until_final_send_button(2)
+
+        self.assertTrue(cache.ready)
+        self.assertEqual(cache.available_from_batch, 1)
+        self.assertEqual(cache.window_rect, rect)
+        self.assertEqual(cache.recipient_checkbox_points_bottom_to_top, [(0.30, 0.80), (0.30, 0.74)])
+        self.assertEqual(cache.final_send_button_ratio, (0.56, 0.78))
+        flow._scroll_recipient_picker_to_bottom.assert_called_once_with(rect, 1, require_scrollbar_thumb=True)
+        flow._click_final_send_button.assert_not_called()
+        flow._cancel_recipient_picker.assert_called_once_with(rect)
+
+    def test_preflight_cache_can_be_reused_from_first_real_batch(self):
+        flow = ForwardFlow(AppConfig(), install_stop_hotkey=False)
+        rect = WindowRect(0, 0, 1600, 900)
+        cache = ForwardFlow(AppConfig(), install_stop_hotkey=False).preflight_cache_from_values(
+            window_rect=rect,
+            recipient_checkbox_points_bottom_to_top=[(0.30, 0.80)],
+            recipient_scroll_drag=((790, 300), (790, 760)),
+            recipient_scroll_track=(790, 760),
+            final_send_button_ratio=(0.56, 0.78),
+        )
+
+        flow.apply_preflight_cache(cache)
+
+        self.assertTrue(flow._can_use_fast_path(1))
+
     def test_recipient_picker_open_detection_falls_back_to_wide_region(self):
         with tempfile.TemporaryDirectory() as d:
             flow = ForwardFlow(AppConfig(), screenshot_dir=d, install_stop_hotkey=False)
@@ -351,6 +393,86 @@ class ForwardFlowTest(unittest.TestCase):
         self.assertAlmostEqual(start[1], round(rect.height * 0.285), delta=2)
         self.assertGreater(end[1], round(rect.height * 0.830))
         self.assertLess(end[1], round(rect.height * 0.860))
+
+    def test_scroll_recipient_picker_reveals_scrollbar_before_detection(self):
+        flow = ForwardFlow(AppConfig(), install_stop_hotkey=False)
+        rect = WindowRect(0, 0, 1920, 1080)
+        events = []
+        flow._save_recipient_list_checkpoint = mock.Mock(return_value=Path("before.png"))
+        flow._save_window_checkpoint = mock.Mock(return_value=Path("scrollbar.png"))
+        flow._reveal_recipient_scrollbar = mock.Mock(side_effect=lambda *_args: events.append("reveal"))
+        flow._detect_recipient_scrollbar_thumb = mock.Mock(
+            side_effect=lambda *_args: events.append("detect") or (0.493, 0.620, 0.855)
+        )
+        flow._sleep = mock.Mock()
+
+        flow._scroll_recipient_picker_to_bottom(rect, 1, require_scrollbar_thumb=True)
+
+        self.assertEqual(events, ["reveal", "detect"])
+        self.assertIsNotNone(flow._fast_path.recipient_scroll_drag)
+        self.assertEqual(flow._fast_path.recipient_scroll_track, rect.relative_point(0.494, 0.855))
+
+    def test_scroll_recipient_picker_requires_detected_scrollbar_during_preflight(self):
+        flow = ForwardFlow(AppConfig(), install_stop_hotkey=False)
+        rect = WindowRect(0, 0, 1920, 1080)
+        flow._save_recipient_list_checkpoint = mock.Mock(return_value=Path("before.png"))
+        flow._save_window_checkpoint = mock.Mock(return_value=Path("scrollbar.png"))
+        flow._reveal_recipient_scrollbar = mock.Mock(return_value=(700, 600))
+        flow._detect_recipient_scrollbar_thumb = mock.Mock(return_value=None)
+        flow._sleep = mock.Mock()
+
+        with self.assertRaisesRegex(RuntimeError, "screenshot=scrollbar.png"):
+            flow._scroll_recipient_picker_to_bottom(rect, 1, require_scrollbar_thumb=True)
+
+    def test_scroll_recipient_picker_accepts_stable_bottom_when_detected_thumb_ratio_is_below_old_fixed_threshold(self):
+        flow = ForwardFlow(AppConfig(), install_stop_hotkey=False)
+        rect = WindowRect(-4, -4, 2888, 1712)
+        list_paths = [Path(f"list_{index}.png") for index in range(7)]
+        scrollbar_paths = [Path(f"scrollbar_{index}.png") for index in range(7)]
+        flow._save_recipient_list_checkpoint = mock.Mock(side_effect=list_paths)
+        flow._save_window_checkpoint = mock.Mock(side_effect=scrollbar_paths)
+        flow._detect_recipient_scrollbar_thumb = mock.Mock(
+            side_effect=[
+                (0.494, 0.311, 0.523),
+                (0.494, 0.612, 0.820),
+                (0.494, 0.612, 0.820),
+                (0.494, 0.612, 0.820),
+                (0.494, 0.612, 0.820),
+                (0.494, 0.612, 0.820),
+                (0.494, 0.612, 0.820),
+            ]
+        )
+        flow._recipient_list_image_difference = mock.Mock(side_effect=[17.2, 0.0, 0.0, 0.0, 0.0, 0.0])
+        flow.window.drag_screen = mock.Mock(return_value=True)
+        flow.window.click_screen = mock.Mock(return_value=True)
+        flow._reveal_recipient_scrollbar = mock.Mock(return_value=(1050, 960))
+        flow._sleep = mock.Mock()
+
+        flow._scroll_recipient_picker_to_bottom(rect, 1, require_scrollbar_thumb=True)
+
+        self.assertEqual(flow._fast_path.recipient_scroll_track, rect.relative_point(0.494, 0.855))
+        self.assertIsNotNone(flow._fast_path.recipient_scroll_drag)
+
+    def test_fast_path_scroll_uses_cached_scrollbar_coordinates_without_detection(self):
+        flow = ForwardFlow(AppConfig(), install_stop_hotkey=False)
+        rect = WindowRect(0, 0, 1920, 1080)
+        flow._fast_path.ready = True
+        flow._fast_path.available_from_batch = 1
+        flow._fast_path.window_rect = rect
+        flow._fast_path.recipient_scroll_drag = ((946, 650), (946, 800))
+        flow._fast_path.recipient_scroll_track = (946, 923)
+        flow.window.drag_screen = mock.Mock(return_value=True)
+        flow.window.click_screen = mock.Mock(return_value=True)
+        flow._save_recipient_list_checkpoint = mock.Mock(return_value=Path("fast.png"))
+        flow._detect_recipient_scrollbar_thumb = mock.Mock(side_effect=AssertionError("should use cached coordinates"))
+        flow._reveal_recipient_scrollbar = mock.Mock(side_effect=AssertionError("should use cached coordinates"))
+        flow._sleep = mock.Mock()
+
+        flow._scroll_recipient_picker_to_bottom(rect, 1)
+
+        flow.window.drag_screen.assert_called_once_with(946, 650, 946, 800, duration=0.25)
+        flow.window.click_screen.assert_called_once_with(946, 923)
+        flow._detect_recipient_scrollbar_thumb.assert_not_called()
 
     def test_source_context_menu_candidates_use_same_message_rows(self):
         flow = ForwardFlow(AppConfig(), install_stop_hotkey=False)
