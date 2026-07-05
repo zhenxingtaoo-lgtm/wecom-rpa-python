@@ -291,6 +291,20 @@ class ForwardFlowTest(unittest.TestCase):
 
         self.assertTrue(flow._can_use_fast_path(1))
 
+    def test_cancel_recipient_picker_clicks_cancel_button_even_when_escape_succeeds(self):
+        flow = ForwardFlow(AppConfig(), install_stop_hotkey=False)
+        rect = WindowRect(0, 0, 1600, 900)
+        flow._fast_path.final_send_button_ratio = (0.56, 0.78)
+        flow.screen.save_checkpoint = mock.Mock(return_value=Path("cancel.png"))
+        flow.window.send_keys = mock.Mock(return_value=True)
+        flow.window.click_screen = mock.Mock(return_value=True)
+        flow._sleep = mock.Mock()
+
+        flow._cancel_recipient_picker(rect)
+
+        flow.window.send_keys.assert_not_called()
+        flow.window.click_screen.assert_called_once_with(*rect.relative_point(0.685, 0.78))
+
     def test_recipient_picker_open_detection_falls_back_to_wide_region(self):
         with tempfile.TemporaryDirectory() as d:
             flow = ForwardFlow(AppConfig(), screenshot_dir=d, install_stop_hotkey=False)

@@ -1821,17 +1821,29 @@ class ForwardFlow:
             "recipient_picker_cancel_before",
             region=Region(rect.left, rect.top, rect.width, rect.height),
         )
-        send_keys = getattr(self.window, "send_keys", None)
-        closed_by_escape = bool(callable(send_keys) and send_keys("{ESC}"))
-        if not closed_by_escape:
-            self.window.click_screen(
-                rect.left + int(rect.width * 0.863),
-                rect.top + int(rect.height * 0.253),
+        method = "cancel_button"
+        cancel_ratio = (0.685, 0.780)
+        if self._fast_path.final_send_button_ratio is not None:
+            send_x, send_y = self._fast_path.final_send_button_ratio
+            cancel_ratio = (min(0.86, send_x + 0.125), send_y)
+        cancel_x, cancel_y = rect.relative_point(*cancel_ratio)
+        closed = bool(self.window.click_screen(cancel_x, cancel_y))
+        if not closed:
+            method = "fixed_close"
+            closed = bool(
+                self.window.click_screen(
+                    rect.left + int(rect.width * 0.863),
+                    rect.top + int(rect.height * 0.253),
+                )
             )
+        if not closed:
+            method = "escape"
+            send_keys = getattr(self.window, "send_keys", None)
+            closed = bool(callable(send_keys) and send_keys("{ESC}"))
         self._sleep(0.35)
         log.info(
             "关闭收件人弹窗完成：method=%s screenshot=%s elapsed=%.2fs",
-            "escape" if closed_by_escape else "fixed_close",
+            method,
             image_path,
             time.monotonic() - started,
         )
