@@ -21,11 +21,12 @@ from .screen import (
     SOURCE_CHECKBOX_COLUMN_MAX_Y,
     SOURCE_CHECKBOX_COLUMN_MIN_X,
     SOURCE_CHECKBOX_COLUMN_MIN_Y,
+    Region,
     ScreenInspector,
     fullscreen_point_to_window_ratio,
     select_aligned_checkbox_column,
 )
-from .wecom_window import WeComWindow
+from .wecom_window import WeComWindow, WindowRect
 
 log = logging.getLogger(__name__)
 
@@ -62,6 +63,51 @@ class SourceSelectionInspection:
     matched_count: int
     points: list[tuple[float, float]]
     forward_button_ratio: tuple[float, float] | None = None
+
+
+def _format_ratio_point_with_abs(
+    rect: WindowRect | None,
+    point: tuple[float, float],
+) -> str:
+    x_ratio, y_ratio = point
+    if rect is None:
+        return f"比例=({x_ratio:.3f}, {y_ratio:.3f})"
+    abs_x, abs_y = rect.relative_point(x_ratio, y_ratio)
+    return f"比例=({x_ratio:.3f}, {y_ratio:.3f}) 屏幕坐标=({abs_x}, {abs_y})"
+
+
+def _format_region(region: Region | None) -> str:
+    if region is None:
+        return "未识别"
+    return f"left={region.left} top={region.top} width={region.width} height={region.height}"
+
+
+def format_preflight_coordinate_log(cache: FastPathState, elapsed: float) -> str:
+    rect = cache.window_rect
+    checkbox_parts = [
+        f"第{index}个多选框[{_format_ratio_point_with_abs(rect, point)}]"
+        for index, point in enumerate(cache.recipient_checkbox_points_bottom_to_top or [], start=1)
+    ]
+    drag_start = None
+    drag_end = None
+    if cache.recipient_scroll_drag is not None:
+        drag_start, drag_end = cache.recipient_scroll_drag
+    final_button = (
+        _format_ratio_point_with_abs(rect, cache.final_send_button_ratio)
+        if cache.final_send_button_ratio is not None
+        else "未识别"
+    )
+    picker_rect_text = f"会话选择框坐标={_format_region(cache.recipient_picker_rect)} "
+    return (
+        picker_rect_text +
+        "检查预演完成："
+        f"耗时={elapsed:.2f}秒 "
+        f"9个多选框坐标={checkbox_parts} "
+        f"滚动条拖拽开始坐标={drag_start} "
+        f"滚动条拖拽结束坐标={drag_end} "
+        f"滚动条底部参考坐标={cache.recipient_scroll_track} "
+        f"最终发送按钮坐标={final_button}"
+    )
 
 
 @dataclass(frozen=True)
@@ -712,12 +758,7 @@ class WeComRpaApp:
             preflight_cache = preflight_flow.preflight_first_batch_until_final_send_button(preflight_count)
             inspection = replace(inspection, preflight_cache=preflight_cache)
             self._check_log(
-                "检查预演完成："
-                f"elapsed={time.monotonic() - preflight_started:.2f}s "
-                f"recipient_points={[(round(x, 3), round(y, 3)) for x, y in (preflight_cache.recipient_checkbox_points_bottom_to_top or [])]} "
-                f"scroll_drag={preflight_cache.recipient_scroll_drag} "
-                f"scroll_track={preflight_cache.recipient_scroll_track} "
-                f"final_send_button={preflight_cache.final_send_button_ratio}",
+                format_preflight_coordinate_log(preflight_cache, time.monotonic() - preflight_started),
                 options.log_file,
             )
             self.current_inspection = inspection

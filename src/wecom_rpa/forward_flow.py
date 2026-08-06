@@ -4,6 +4,7 @@ import logging
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 
 from .config import AppConfig
@@ -48,6 +49,7 @@ class SentinelTrimPlan:
 @dataclass
 class FastPathState:
     window_rect: WindowRect | None = None
+    recipient_picker_rect: Region | None = None
     recipient_checkbox_points_bottom_to_top: list[tuple[float, float]] | None = None
     recipient_scroll_drag: tuple[tuple[int, int], tuple[int, int]] | None = None
     recipient_scroll_track: tuple[int, int] | None = None
@@ -93,6 +95,7 @@ class ForwardFlow:
         self._source_context_right_click: tuple[float, float, float] | None = None
         self._source_multiselect_menu_offset: tuple[int, int] | None = None
         self._last_recipient_checkbox_x_ratio: float | None = None
+        self._last_recipient_picker_rect: Region | None = None
         self._fast_path = FastPathState()
 
     def _emit_progress(self, event: str, **payload: Any) -> None:
@@ -224,6 +227,7 @@ class ForwardFlow:
     ) -> FastPathState:
         return FastPathState(
             window_rect=window_rect,
+            recipient_picker_rect=self._last_recipient_picker_rect,
             recipient_checkbox_points_bottom_to_top=list(recipient_checkbox_points_bottom_to_top),
             recipient_scroll_drag=recipient_scroll_drag,
             recipient_scroll_track=recipient_scroll_track,
@@ -237,6 +241,7 @@ class ForwardFlow:
             return
         self._fast_path = FastPathState(
             window_rect=cache.window_rect,
+            recipient_picker_rect=cache.recipient_picker_rect,
             recipient_checkbox_points_bottom_to_top=list(cache.recipient_checkbox_points_bottom_to_top or []),
             recipient_scroll_drag=cache.recipient_scroll_drag,
             recipient_scroll_track=cache.recipient_scroll_track,
@@ -244,6 +249,7 @@ class ForwardFlow:
             ready=True,
             available_from_batch=cache.available_from_batch,
         )
+        self._last_recipient_picker_rect = cache.recipient_picker_rect
         if self._fast_path.recipient_checkbox_points_bottom_to_top:
             self._last_recipient_checkbox_x_ratio = (
                 sum(x for x, _y in self._fast_path.recipient_checkbox_points_bottom_to_top)
@@ -253,6 +259,7 @@ class ForwardFlow:
     def export_preflight_cache(self) -> FastPathState:
         return FastPathState(
             window_rect=self._fast_path.window_rect,
+            recipient_picker_rect=self._fast_path.recipient_picker_rect,
             recipient_checkbox_points_bottom_to_top=list(self._fast_path.recipient_checkbox_points_bottom_to_top or []),
             recipient_scroll_drag=self._fast_path.recipient_scroll_drag,
             recipient_scroll_track=self._fast_path.recipient_scroll_track,
@@ -921,12 +928,26 @@ class ForwardFlow:
         _area, x_ratio, y_ratio = sorted(candidates, key=lambda item: item[0], reverse=True)[0]
         return (x_ratio, y_ratio)
 
-    def _recipient_scrollbar_track_point(self, rect: WindowRect) -> tuple[float, float]:
+    def _recipient_scrollbar_track_point(
+        self,
+        rect: WindowRect,
+        picker_rect: Region | None = None,
+    ) -> tuple[float, float]:
+        if picker_rect is not None:
+            x_ratio = (picker_rect.left + picker_rect.width * 0.34 - rect.left) / rect.width
+            return (min(0.95, max(0.05, x_ratio)), self._recipient_scrollbar_track_bottom_ratio(rect, picker_rect=picker_rect))
         if rect.width >= 1600:
-            return (0.494, self._recipient_scrollbar_track_bottom_ratio(rect))
-        return (0.492, self._recipient_scrollbar_track_bottom_ratio(rect))
+            return (0.494, self._recipient_scrollbar_track_bottom_ratio(rect, picker_rect=picker_rect))
+        return (0.492, self._recipient_scrollbar_track_bottom_ratio(rect, picker_rect=picker_rect))
 
-    def _recipient_scrollbar_track_bottom_ratio(self, rect: WindowRect) -> float:
+    def _recipient_scrollbar_track_bottom_ratio(
+        self,
+        rect: WindowRect,
+        picker_rect: Region | None = None,
+    ) -> float:
+        if picker_rect is not None:
+            bottom_ratio = (picker_rect.top + picker_rect.height - rect.top) / rect.height
+            return min(0.950, max(0.600, bottom_ratio))
         if rect.width >= 1600:
             return 0.855
         return 0.850
@@ -935,16 +956,163 @@ class ForwardFlow:
         self,
         thumb: tuple[float, float, float] | None,
         rect: WindowRect,
+        picker_rect: Region | None = None,
     ) -> bool:
         if thumb is None:
             return False
         _x_ratio, _top_ratio, bottom_ratio = thumb
-        return bottom_ratio >= self._recipient_scrollbar_track_bottom_ratio(rect) - 0.010
+        return bottom_ratio >= self._recipient_scrollbar_track_bottom_ratio(rect, picker_rect=picker_rect) - 0.010
+
+    def _detect_recipient_picker_rect(self, image_path, rect: WindowRect) -> Region | None:
+        image = Path(image_path)
+        if not image.exists() or image.suffix.lower() != ".png":
+            return None
+        try:
+            import cv2  # type: ignore
+            import numpy as np  # type: ignore
+        except Exception as exc:
+            log.debug("OpenCV/NumPy 涓嶅彲鐢紝璺宠繃鏀朵欢浜哄脊绐楃煩褰㈣瘑鍒細%s", exc)
+            return None
+
+        bitmap = cv2.imread(str(image), cv2.IMREAD_COLOR)
+        if bitmap is None:
+            return None
+        image_height, image_width = bitmap.shape[:2]
+        if image_width <= 0 or image_height <= 0:
+            return None
+
+        roi_left = 0
+        roi_right = image_width
+        roi_top = round(image_height * 0.040)
+        roi_bottom = round(image_height * 0.980)
+        roi = bitmap[roi_top:roi_bottom, roi_left:roi_right]
+        if roi.size == 0:
+            return None
+
+        blue, green, red = cv2.split(roi)
+        maximum = np.maximum(np.maximum(red, green), blue)
+        minimum = np.minimum(np.minimum(red, green), blue)
+        light_mask = (
+            (red >= 232)
+            & (green >= 232)
+            & (blue >= 232)
+            & (maximum - minimum <= 18)
+        ).astype("uint8") * 255
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+        light_mask = cv2.morphologyEx(light_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        component_count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(light_mask, connectivity=8)
+
+        min_width = image_width * 0.250
+        min_height = image_height * 0.350
+        candidates: list[tuple[int, Region]] = []
+        for index in range(1, component_count):
+            left, top, width, height, area = (int(value) for value in stats[index])
+            if width < min_width or height < min_height:
+                continue
+            abs_left = rect.left + roi_left + left
+            abs_top = rect.top + roi_top + top
+            region = Region(abs_left, abs_top, width, height)
+            candidates.append((area, region))
+        if not candidates:
+            return None
+        _area, region = sorted(candidates, key=lambda item: item[0], reverse=True)[0]
+        region = self._refine_recipient_picker_rect_left_edge(bitmap, rect, region)
+        log.info("识别到会话选择弹窗矩形：rect=%s screenshot=%s", region, image)
+        return region
+
+    def _refine_recipient_picker_rect_left_edge(
+        self,
+        bitmap,
+        rect: WindowRect,
+        region: Region,
+    ) -> Region:
+        try:
+            import cv2  # type: ignore
+            import numpy as np  # type: ignore
+        except Exception:
+            return region
+
+        image_height, image_width = bitmap.shape[:2]
+        if image_width <= 0 or image_height <= 0:
+            return region
+
+        gray = cv2.cvtColor(bitmap, cv2.COLOR_BGR2GRAY)
+        band_top = max(0, round(image_height * 0.12))
+        band_bottom = min(image_height, round(image_height * 0.88))
+        band = gray[band_top:band_bottom, :]
+        if band.size == 0:
+            return region
+
+        gradient = np.abs(np.diff(band.astype(np.int16), axis=1)).mean(axis=0)
+        smoothed = np.convolve(gradient, np.ones(9) / 9, mode="same")
+        horizontal_gradient = np.abs(np.diff(gray.astype(np.int16), axis=0))
+        top_search_left = max(0, round(image_width * 0.10))
+        top_search_right = min(image_width, round(image_width * 0.90))
+        top_search_top = max(0, round(image_height * 0.08))
+        top_search_bottom = min(image_height - 2, round(image_height * 0.40))
+        top_band = horizontal_gradient[top_search_top:top_search_bottom, top_search_left:top_search_right]
+        if top_band.size:
+            top_scores = top_band.mean(axis=1)
+            top_scores = np.convolve(top_scores, np.ones(7) / 7, mode="same")
+            top_offset = int(np.argmax(top_scores))
+            top_y = top_search_top + top_offset
+            if float(top_scores[top_offset]) >= 8.0:
+                edge_row = min(image_height - 1, top_y + max(8, round(image_height * 0.010)))
+                row_gradient = np.abs(np.diff(gray[edge_row, :].astype(np.int16)))
+                row_gradient = np.convolve(row_gradient, np.ones(9) / 9, mode="same")
+                edge_threshold = max(8.0, float(row_gradient[top_search_left:top_search_right].mean()) + 2.5)
+                for x in range(max(top_search_left, round(image_width * 0.12)), min(top_search_right, round(image_width * 0.55))):
+                    if float(row_gradient[x]) < edge_threshold:
+                        continue
+                    if region.left <= x <= region.left + region.width * 0.55:
+                        new_left = rect.left + x
+                        right = region.left + region.width
+                        if right - new_left >= image_width * 0.25:
+                            refined = Region(new_left, region.top, right - new_left, region.height)
+                            log.info("按弹窗顶部边缘修正会话选择框左边界：before=%s after=%s top_y=%s", region, refined, top_y)
+                            return refined
+
+        search_left = max(0, round(image_width * 0.12))
+        search_right = min(image_width - 2, round(image_width * 0.55))
+        if search_right <= search_left:
+            return region
+        threshold = max(8.0, float(smoothed[search_left:search_right].mean()) + 2.5)
+
+        groups: list[list[tuple[float, int]]] = []
+        for x in range(search_left, search_right):
+            score = float(smoothed[x])
+            if score < threshold:
+                continue
+            if not groups or x - groups[-1][-1][1] > 3:
+                groups.append([])
+            groups[-1].append((score, x))
+
+        min_dialog_left = round(image_width * 0.18)
+        max_dialog_left = round(image_width * 0.42)
+        best_x: int | None = None
+        for group in groups:
+            _score, x = max(group, key=lambda item: item[0])
+            if x < min_dialog_left or x > max_dialog_left:
+                continue
+            if region.left <= x <= region.left + region.width * 0.55:
+                best_x = x
+                break
+        if best_x is None or best_x <= region.left:
+            return region
+
+        new_left = rect.left + best_x
+        right = region.left + region.width
+        if right - new_left < image_width * 0.25:
+            return region
+        refined = Region(new_left, region.top, right - new_left, region.height)
+        log.info("修正会话选择框左边界：before=%s after=%s", region, refined)
+        return refined
 
     def _detect_recipient_scrollbar_thumb(
         self,
         image_path,
         rect: WindowRect,
+        picker_rect: Region | None = None,
     ) -> tuple[float, float, float] | None:
         try:
             import cv2  # type: ignore
@@ -960,11 +1128,27 @@ class ForwardFlow:
         if image_width <= 0 or image_height <= 0:
             return None
 
-        track_x_ratio, _track_bottom = self._recipient_scrollbar_track_point(rect)
-        roi_left = max(0, round(image_width * (track_x_ratio - 0.035)))
-        roi_right = min(image_width, round(image_width * (track_x_ratio + 0.035)))
-        roi_top = max(0, round(image_height * 0.200))
-        roi_bottom = min(image_height, round(image_height * 0.900))
+        track_x_ratio, _track_bottom = self._recipient_scrollbar_track_point(rect, picker_rect=picker_rect)
+        if picker_rect is not None:
+            picker_left_ratio = max(0.0, min(1.0, (picker_rect.left - rect.left) / rect.width))
+            picker_width_ratio = max(0.0, min(1.0, picker_rect.width / rect.width))
+            # The picker can be resized very wide. Search the whole left list area instead of a
+            # narrow band around the old center-line estimate.
+            roi_left_ratio = max(0.0, picker_left_ratio + picker_width_ratio * 0.18)
+            roi_right_ratio = min(1.0, picker_left_ratio + picker_width_ratio * 0.62)
+            roi_left_ratio = min(roi_left_ratio, max(0.0, track_x_ratio - 0.20))
+            roi_right_ratio = max(roi_right_ratio, min(1.0, track_x_ratio + 0.20))
+            roi_top_ratio = max(0.0, (picker_rect.top + picker_rect.height * 0.14 - rect.top) / rect.height)
+            roi_bottom_ratio = min(1.0, (picker_rect.top + picker_rect.height * 0.90 - rect.top) / rect.height)
+        else:
+            roi_left_ratio = max(0.0, track_x_ratio - 0.120)
+            roi_right_ratio = min(1.0, track_x_ratio + 0.120)
+            roi_top_ratio = 0.200
+            roi_bottom_ratio = 0.900
+        roi_left = max(0, round(image_width * roi_left_ratio))
+        roi_right = min(image_width, round(image_width * roi_right_ratio))
+        roi_top = max(0, round(image_height * roi_top_ratio))
+        roi_bottom = min(image_height, round(image_height * roi_bottom_ratio))
         roi = bitmap[roi_top:roi_bottom, roi_left:roi_right]
         if roi.size == 0:
             return None
@@ -983,7 +1167,7 @@ class ForwardFlow:
         ).astype("uint8") * 255
 
         component_count, _labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
-        candidates: list[tuple[int, float, float, float]] = []
+        candidates: list[tuple[int, int, int, float, float, float, float]] = []
         for index in range(1, component_count):
             left, top, width, height, area = (int(value) for value in stats[index])
             if area < 40:
@@ -996,40 +1180,78 @@ class ForwardFlow:
                 continue
             center_x, _center_y = centroids[index]
             x_ratio = (roi_left + float(center_x)) / image_width
-            if abs(x_ratio - track_x_ratio) > 0.035:
-                continue
             top_ratio = (roi_top + top) / image_height
             bottom_ratio = (roi_top + top + height) / image_height
-            candidates.append((area, x_ratio, top_ratio, bottom_ratio))
+            distance = abs(x_ratio - track_x_ratio)
+            candidates.append((area, height, width, distance, x_ratio, top_ratio, bottom_ratio))
 
         if not candidates:
+            log.info(
+                "收件人滚动条滑块识别失败：弹窗坐标=%s 预估轨道x=%.3f 扫描区域像素=(left=%s, top=%s, right=%s, bottom=%s) 候选=[] screenshot=%s",
+                picker_rect,
+                track_x_ratio,
+                roi_left,
+                roi_top,
+                roi_right,
+                roi_bottom,
+                image_path,
+            )
             return None
-        _area, x_ratio, top_ratio, bottom_ratio = sorted(candidates, key=lambda item: item[0], reverse=True)[0]
+        area, _height, _width, _distance, x_ratio, top_ratio, bottom_ratio = sorted(
+            candidates,
+            key=lambda item: (item[0], item[1], -item[3]),
+            reverse=True,
+        )[0]
+        candidate_log = [
+            {
+                "x": round(item[4], 3),
+                "top": round(item[5], 3),
+                "bottom": round(item[6], 3),
+                "宽": item[2],
+                "高": item[1],
+                "面积": item[0],
+            }
+            for item in sorted(candidates, key=lambda item: item[0], reverse=True)[:8]
+        ]
+        log.info(
+            "收件人滚动条滑块识别：弹窗坐标=%s 预估轨道x=%.3f 扫描区域像素=(left=%s, top=%s, right=%s, bottom=%s) 候选=%s 最终=(x=%.3f, top=%.3f, bottom=%.3f, 面积=%s) screenshot=%s",
+            picker_rect,
+            track_x_ratio,
+            roi_left,
+            roi_top,
+            roi_right,
+            roi_bottom,
+            candidate_log,
+            x_ratio,
+            top_ratio,
+            bottom_ratio,
+            area,
+            image_path,
+        )
         return (x_ratio, top_ratio, bottom_ratio)
 
     def _recipient_scrollbar_drag_candidates(
         self,
         rect: WindowRect,
         thumb: tuple[float, float, float] | None = None,
+        picker_rect: Region | None = None,
     ) -> list[tuple[tuple[int, int], tuple[int, int]]]:
         if thumb is not None:
-            x_ratio, top_ratio, bottom_ratio = thumb
-            height_ratio = max(0.0, bottom_ratio - top_ratio)
-            center_y_ratio = top_ratio + height_ratio / 2.0
-            target_y_ratio = self._recipient_scrollbar_track_bottom_ratio(rect) - height_ratio / 2.0
-            target_y_ratio = min(self._recipient_scrollbar_track_bottom_ratio(rect), max(center_y_ratio, target_y_ratio))
-            return [(rect.relative_point(x_ratio, center_y_ratio), rect.relative_point(x_ratio, target_y_ratio))]
+            x_ratio, top_ratio, _bottom_ratio = thumb
+            track_bottom_ratio = self._recipient_scrollbar_track_bottom_ratio(rect, picker_rect=picker_rect)
+            target_y_ratio = max(top_ratio, track_bottom_ratio)
+            return [(rect.relative_point(x_ratio, top_ratio), rect.relative_point(x_ratio, target_y_ratio))]
         if rect.width >= 1600:
             x_ratio, start_y_ratios, end_y_ratio = (
                 0.494,
                 (0.285, 0.330, 0.375, 0.420),
-                self._recipient_scrollbar_track_bottom_ratio(rect),
+                self._recipient_scrollbar_track_bottom_ratio(rect, picker_rect=picker_rect),
             )
         else:
             x_ratio, start_y_ratios, end_y_ratio = (
                 0.492,
                 (0.315, 0.360, 0.405),
-                self._recipient_scrollbar_track_bottom_ratio(rect),
+                self._recipient_scrollbar_track_bottom_ratio(rect, picker_rect=picker_rect),
             )
         end = rect.relative_point(x_ratio, end_y_ratio)
         return [(rect.relative_point(x_ratio, start_y), end) for start_y in start_y_ratios]
@@ -1101,11 +1323,8 @@ class ForwardFlow:
             if not drag_screen(*drag_start, *drag_end, duration=0.25):
                 raise RuntimeError(f"快速模式拖动收件人滚动条失败：batch={batch_no} start={drag_start} end={drag_end}")
             self._sleep(0.10)
-            if not self.window.click_screen(*track):
-                raise RuntimeError(f"快速模式点击收件人滚动条底部轨道失败：batch={batch_no} abs={track}")
-            self._sleep(0.08)
             screenshot = self._save_recipient_list_checkpoint(f"batch_{batch_no}_recipient_scroll_fast", rect)
-            log.info("Fast path: recipient list scrolled to bottom with cached coordinates: batch=%s screenshot=%s", batch_no, screenshot)
+            log.info("快速模式：已使用缓存坐标拖拽收件人列表到底部：batch=%s 拖拽开始=%s 拖拽结束=%s 底部参考点=%s 截图=%s", batch_no, drag_start, drag_end, track, screenshot)
             return
         previous_path = self._save_recipient_list_checkpoint(
             f"batch_{batch_no}_recipient_scroll_before",
@@ -1113,13 +1332,28 @@ class ForwardFlow:
         )
         self._reveal_recipient_scrollbar(rect, batch_no)
         scrollbar_probe_path = self._save_window_checkpoint(f"batch_{batch_no}_recipient_scrollbar_before", rect)
-        scrollbar_thumb = self._detect_recipient_scrollbar_thumb(scrollbar_probe_path, rect)
+        picker_rect = self._detect_recipient_picker_rect(scrollbar_probe_path, rect)
+        if picker_rect is not None:
+            self._last_recipient_picker_rect = picker_rect
+            self._fast_path.recipient_picker_rect = picker_rect
+            click_x_ratio, click_y_ratio = self._recipient_scrollbar_track_point(rect, picker_rect=picker_rect)
+            click_x, click_y = rect.relative_point(click_x_ratio, click_y_ratio)
+            log.info(
+                "使用识别到的会话选择弹窗底部作为滚动条终点：batch=%s picker_rect=%s track_ratio=(%.3f, %.3f) abs=(%s, %s)",
+                batch_no,
+                picker_rect,
+                click_x_ratio,
+                click_y_ratio,
+                click_x,
+                click_y,
+            )
+        scrollbar_thumb = self._detect_recipient_scrollbar_thumb(scrollbar_probe_path, rect, picker_rect=picker_rect)
         if scrollbar_thumb is not None:
             log.info(
                 "识别到收件人滚动条滑块：batch=%s thumb=%s at_bottom=%s screenshot=%s",
                 batch_no,
                 tuple(round(value, 3) for value in scrollbar_thumb),
-                self._recipient_scrollbar_thumb_at_bottom(scrollbar_thumb, rect),
+                self._recipient_scrollbar_thumb_at_bottom(scrollbar_thumb, rect, picker_rect=picker_rect),
                 scrollbar_probe_path,
             )
         else:
@@ -1129,14 +1363,14 @@ class ForwardFlow:
                     f"已停止以避免误选。batch={batch_no} screenshot={scrollbar_probe_path}"
                 )
             log.warning("未识别到收件人滚动条滑块，将使用固定候选拖拽点：batch=%s screenshot=%s", batch_no, scrollbar_probe_path)
-        if self._recipient_scrollbar_thumb_at_bottom(scrollbar_thumb, rect):
-            drag_candidates = self._recipient_scrollbar_drag_candidates(rect, thumb=scrollbar_thumb)
+        if self._recipient_scrollbar_thumb_at_bottom(scrollbar_thumb, rect, picker_rect=picker_rect):
+            drag_candidates = self._recipient_scrollbar_drag_candidates(rect, thumb=scrollbar_thumb, picker_rect=picker_rect)
             self._fast_path.recipient_scroll_track = (click_x, click_y)
             if drag_candidates:
                 self._fast_path.recipient_scroll_drag = drag_candidates[0]
             log.info("收件人滚动条滑块已在底部：batch=%s screenshot=%s", batch_no, scrollbar_probe_path)
             return
-        drag_candidates = self._recipient_scrollbar_drag_candidates(rect, thumb=scrollbar_thumb)
+        drag_candidates = self._recipient_scrollbar_drag_candidates(rect, thumb=scrollbar_thumb, picker_rect=picker_rect)
         stable_rounds = 0
         moved = False
 
@@ -1166,11 +1400,8 @@ class ForwardFlow:
             if not drag_screen(*drag_start, *drag_end, duration=0.25):
                 raise RuntimeError(f"快速模式拖动收件人滚动条失败：batch={batch_no} start={drag_start} end={drag_end}")
             self._sleep(0.10)
-            if not self.window.click_screen(*track):
-                raise RuntimeError(f"快速模式点击收件人滚动条底部轨道失败：batch={batch_no} abs={track}")
-            self._sleep(0.08)
             screenshot = self._save_recipient_list_checkpoint(f"batch_{batch_no}_recipient_scroll_fast", rect)
-            log.info("快速模式：收件人列表滚动到底部完成：batch=%s screenshot=%s", batch_no, screenshot)
+            log.info("快速模式：已使用缓存坐标拖拽收件人列表到底部：batch=%s 拖拽开始=%s 拖拽结束=%s 底部参考点=%s 截图=%s", batch_no, drag_start, drag_end, track, screenshot)
             return
 
         for attempt, (drag_start, drag_end) in enumerate(drag_candidates, start=1):
@@ -1193,8 +1424,8 @@ class ForwardFlow:
                 f"batch_{batch_no}_recipient_scrollbar_after_drag_{attempt}",
                 rect,
             )
-            dragged_thumb = self._detect_recipient_scrollbar_thumb(dragged_scrollbar_path, rect)
-            dragged_thumb_at_bottom = self._recipient_scrollbar_thumb_at_bottom(dragged_thumb, rect)
+            dragged_thumb = self._detect_recipient_scrollbar_thumb(dragged_scrollbar_path, rect, picker_rect=picker_rect)
+            dragged_thumb_at_bottom = self._recipient_scrollbar_thumb_at_bottom(dragged_thumb, rect, picker_rect=picker_rect)
             difference = self._recipient_list_image_difference(previous_path, dragged_path)
             if difference is None:
                 raise RuntimeError(
@@ -1229,6 +1460,38 @@ class ForwardFlow:
                 f"batch={batch_no} candidates={drag_candidates} screenshot={previous_path}"
             )
 
+        log.info(
+            "收件人列表已完成拖拽落底，不再点击底部轨道：batch=%s 底部参考比例=(%.3f, %.3f) 底部参考坐标=(%s, %s)",
+            batch_no,
+            click_x_ratio,
+            click_y_ratio,
+            click_x,
+            click_y,
+        )
+        self._sleep(0.12)
+        current_path = self._save_recipient_list_checkpoint(
+            f"batch_{batch_no}_recipient_scroll_confirmed",
+            rect,
+        )
+        current_scrollbar_path = self._save_window_checkpoint(
+            f"batch_{batch_no}_recipient_scrollbar_confirmed",
+            rect,
+        )
+        current_thumb = self._detect_recipient_scrollbar_thumb(current_scrollbar_path, rect, picker_rect=picker_rect)
+        current_thumb_at_bottom = self._recipient_scrollbar_thumb_at_bottom(current_thumb, rect, picker_rect=picker_rect)
+        log.info(
+            "收件人列表滚动落底操作已完成，跳过局部画面稳定性硬判断：batch=%s moved=%s thumb=%s thumb_at_bottom=%s screenshot=%s",
+            batch_no,
+            moved,
+            tuple(round(value, 3) for value in current_thumb) if current_thumb is not None else None,
+            current_thumb_at_bottom,
+            current_path,
+        )
+        self._fast_path.recipient_scroll_track = (click_x, click_y)
+        if self._fast_path.recipient_scroll_drag is None and drag_candidates:
+            self._fast_path.recipient_scroll_drag = drag_candidates[0]
+        return
+
         verification_rounds = max_fallback_rounds + 2
         for round_no in range(1, verification_rounds + 1):
             log.info(
@@ -1255,8 +1518,8 @@ class ForwardFlow:
                 f"batch_{batch_no}_recipient_scrollbar_round_{round_no}",
                 rect,
             )
-            current_thumb = self._detect_recipient_scrollbar_thumb(current_scrollbar_path, rect)
-            current_thumb_at_bottom = self._recipient_scrollbar_thumb_at_bottom(current_thumb, rect)
+            current_thumb = self._detect_recipient_scrollbar_thumb(current_scrollbar_path, rect, picker_rect=picker_rect)
+            current_thumb_at_bottom = self._recipient_scrollbar_thumb_at_bottom(current_thumb, rect, picker_rect=picker_rect)
             difference = self._recipient_list_image_difference(previous_path, current_path)
             if difference is None:
                 raise RuntimeError(
@@ -1287,7 +1550,10 @@ class ForwardFlow:
                 current_scrollbar_path,
             )
             previous_path = current_path
-            bottom_confirmed = current_thumb is None or current_thumb_at_bottom or scrollbar_thumb is not None
+            if current_thumb is None:
+                bottom_confirmed = scrollbar_thumb is None and not require_scrollbar_thumb
+            else:
+                bottom_confirmed = current_thumb_at_bottom
             if moved and stable_rounds >= 2 and bottom_confirmed:
                 self._fast_path.recipient_scroll_track = (click_x, click_y)
                 if self._fast_path.recipient_scroll_drag is None and drag_candidates:
@@ -1417,24 +1683,46 @@ class ForwardFlow:
             )
             return selected
         image_path = self._save_window_checkpoint(f"batch_{batch_no}_recipient_checkbox_candidates", rect)
+        picker_rect = self._last_recipient_picker_rect
+        if picker_rect is None:
+            picker_rect = self._detect_recipient_picker_rect(image_path, rect)
+            if picker_rect is not None:
+                self._last_recipient_picker_rect = picker_rect
+                self._fast_path.recipient_picker_rect = picker_rect
+        if picker_rect is None:
+            raise RuntimeError(
+                f"未识别到会话选择框矩形，已停止避免在主界面误识别多选框。batch={batch_no} screenshot={image_path}"
+            )
         find_outlines = getattr(self.screen, "find_checkbox_outline_ratios", None)
         min_x, max_x = self._recipient_checkbox_x_bounds(rect)
         min_y, max_y = self._recipient_checkbox_y_bounds(rect)
-        scan_region = self._expanded_checkbox_scan_region(min_x, min_y, max_x, max_y)
+        scan_region = self._recipient_checkbox_scan_region(rect, min_x, min_y, max_x, max_y)
         raw_points = list(
             find_outlines(
                 image_path,
                 scan_region_ratio=scan_region,
             )
         ) if callable(find_outlines) else []
+        checkbox_like_points = self._filter_recipient_checkbox_like_points(image_path, raw_points)
         candidates = select_aligned_checkbox_column(
-            raw_points,
+            checkbox_like_points,
             min_x=min_x,
             max_x=max_x,
             min_y=min_y,
             max_y=max_y,
+            x_tolerance=0.010,
         )
         candidates = self._dedupe_recipient_checkbox_points(candidates)
+        log.info(
+            "收件人复选框详细坐标：batch=%s 弹窗坐标=%s 扫描区域比例=%s 扫描区域像素=%s raw坐标=%s 像复选框坐标=%s 最终坐标=%s",
+            batch_no,
+            picker_rect,
+            tuple(round(value, 4) for value in scan_region),
+            self._ratio_region_to_pixels(rect, scan_region),
+            self._format_ratio_points_with_pixels(rect, raw_points),
+            self._format_ratio_points_with_pixels(rect, checkbox_like_points),
+            self._format_ratio_points_with_pixels(rect, candidates),
+        )
         log.info(
             "收件人复选框候选识别：batch=%s expected=%s full_window=%s raw=%s filtered=%s",
             batch_no,
@@ -1477,12 +1765,125 @@ class ForwardFlow:
         scan_bottom = min(1.0, max_y + 0.035)
         return (scan_left, scan_top, scan_right - scan_left, scan_bottom - scan_top)
 
+    def _format_ratio_points_with_pixels(
+        self,
+        rect: WindowRect,
+        points: list[tuple[float, float]],
+    ) -> list[tuple[float, float, int, int]]:
+        return [
+            (round(x_ratio, 4), round(y_ratio, 4), *rect.relative_point(x_ratio, y_ratio))
+            for x_ratio, y_ratio in points
+        ]
+
+    def _ratio_region_to_pixels(
+        self,
+        rect: WindowRect,
+        region: tuple[float, float, float, float],
+    ) -> tuple[int, int, int, int]:
+        x_ratio, y_ratio, width_ratio, height_ratio = region
+        left, top = rect.relative_point(x_ratio, y_ratio)
+        right, bottom = rect.relative_point(x_ratio + width_ratio, y_ratio + height_ratio)
+        return (left, top, right, bottom)
+
+    def _recipient_checkbox_scan_region(
+        self,
+        rect: WindowRect,
+        min_x: float,
+        min_y: float,
+        max_x: float,
+        max_y: float,
+    ) -> tuple[float, float, float, float]:
+        scan_left, scan_top, scan_width, scan_height = self._expanded_checkbox_scan_region(
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+        )
+        picker_rect = self._last_recipient_picker_rect
+        if picker_rect is None:
+            return (scan_left, scan_top, scan_width, scan_height)
+
+        picker_left = max(0.0, (picker_rect.left - rect.left) / rect.width)
+        picker_top = max(0.0, (picker_rect.top - rect.top) / rect.height)
+        picker_right = min(1.0, (picker_rect.left + picker_rect.width - rect.left) / rect.width)
+        picker_bottom = min(1.0, (picker_rect.top + picker_rect.height - rect.top) / rect.height)
+        scan_right = min(scan_left + scan_width, picker_right, max_x)
+        scan_bottom = min(scan_top + scan_height, picker_bottom, max_y)
+        scan_left = max(scan_left, picker_left, min_x)
+        scan_top = max(scan_top, picker_top, min_y)
+        return (scan_left, scan_top, max(0.0, scan_right - scan_left), max(0.0, scan_bottom - scan_top))
+
+    def _filter_recipient_checkbox_like_points(
+        self,
+        image_path: Path,
+        points: list[tuple[float, float]],
+    ) -> list[tuple[float, float]]:
+        if not points:
+            return []
+        try:
+            from PIL import Image  # type: ignore
+
+            with Image.open(image_path) as raw:
+                image = raw.convert("RGB")
+                width, height = image.size
+                pixels = image.load()
+                radius = max(4, round(max(width / 1920.0, height / 1080.0, 1.0) * 5))
+                kept: list[tuple[float, float]] = []
+                rejected: list[tuple[float, float, int, int, int]] = []
+                for x_ratio, y_ratio in points:
+                    center_x = round(x_ratio * width)
+                    center_y = round(y_ratio * height)
+                    left = max(0, center_x - radius)
+                    right = min(width, center_x + radius + 1)
+                    top = max(0, center_y - radius)
+                    bottom = min(height, center_y + radius + 1)
+                    total = 0
+                    light = 0
+                    colorful = 0
+                    dark = 0
+                    for y in range(top, bottom):
+                        for x in range(left, right):
+                            red, green, blue = pixels[x, y]
+                            total += 1
+                            channel_min = min(red, green, blue)
+                            channel_max = max(red, green, blue)
+                            if channel_min >= 215:
+                                light += 1
+                            if channel_max - channel_min > 45:
+                                colorful += 1
+                            if channel_min < 120:
+                                dark += 1
+                    if total and light / total >= 0.55 and colorful / total <= 0.25 and dark / total <= 0.25:
+                        kept.append((x_ratio, y_ratio))
+                    else:
+                        rejected.append((x_ratio, y_ratio, light, colorful, dark))
+                if rejected:
+                    log.info(
+                        "已排除不像空复选框的收件人候选：rejected=%s kept=%s",
+                        [(round(x, 3), round(y, 3), light, color, dark) for x, y, light, color, dark in rejected],
+                        [(round(x, 3), round(y, 3)) for x, y in kept],
+                    )
+                return kept
+        except Exception as exc:
+            log.warning("收件人复选框局部像素校验失败，保留原候选：%s", exc)
+            return points
+
     def _recipient_checkbox_x_bounds(self, rect: WindowRect) -> tuple[float, float]:
+        picker_rect = self._last_recipient_picker_rect
+        if picker_rect is not None:
+            left = (picker_rect.left - rect.left) / rect.width
+            right = (picker_rect.left + picker_rect.width * 0.25 - rect.left) / rect.width
+            return (max(0.0, left), min(1.0, right))
         if rect.width >= 1600:
             return (0.235, 0.430)
         return (0.200, 0.380)
 
     def _recipient_checkbox_y_bounds(self, rect: WindowRect) -> tuple[float, float]:
+        picker_rect = self._last_recipient_picker_rect
+        if picker_rect is not None:
+            top = (picker_rect.top + picker_rect.height * 0.20 - rect.top) / rect.height
+            bottom = (picker_rect.top + picker_rect.height * 0.98 - rect.top) / rect.height
+            return (max(0.0, top), min(1.0, bottom))
         if rect.width >= 1600:
             return (0.265, 0.900)
         return (0.290, 0.870)
@@ -1557,6 +1958,31 @@ class ForwardFlow:
         )
 
     def _left_candidate_region(self, rect: WindowRect) -> Region:
+        picker_rect = self._last_recipient_picker_rect
+        if picker_rect is not None:
+            # The recipient picker is resizable.  Keep the OCR crop aligned with
+            # its actual vertical extent instead of the WeCom window's fixed
+            # 26%-91% band; otherwise rows near the bottom of a tall picker are
+            # clipped and become ``unknown-N`` during sentinel verification.
+            min_y, max_y = self._recipient_checkbox_y_bounds(rect)
+            top_ratio = max(
+                (picker_rect.top - rect.top) / rect.height,
+                min_y - 0.040,
+            )
+            bottom_ratio = min(
+                (picker_rect.top + picker_rect.height - rect.top) / rect.height,
+                max_y + 0.040,
+            )
+            if rect.width >= 1600:
+                left_ratio, right_ratio = 0.255, 0.500
+            else:
+                left_ratio, right_ratio = 0.200, 0.500
+            return Region(
+                left=rect.left + round(rect.width * left_ratio),
+                top=rect.top + round(rect.height * top_ratio),
+                width=round(rect.width * (right_ratio - left_ratio)),
+                height=round(rect.height * (bottom_ratio - top_ratio)),
+            )
         if rect.width >= 1600:
             return Region(
                 left=rect.left + round(rect.width * 0.255),
@@ -1585,8 +2011,15 @@ class ForwardFlow:
                 len(selected_y_ratios),
                 len(detected_y_ratios),
             )
-            if not detected_y_ratios or len(detected_y_ratios) > len(selected_y_ratios):
+            if len(detected_y_ratios) > len(selected_y_ratios):
                 return []
+            if len(detected_y_ratios) < len(selected_y_ratios):
+                log.warning(
+                    "左侧蓝色勾选框局部检测不足，改用已点击的收件人行坐标匹配 OCR：expected=%s actual=%s",
+                    len(selected_y_ratios),
+                    len(detected_y_ratios),
+                )
+                detected_y_ratios = list(selected_y_ratios)
         row_y_ratios = sorted(detected_y_ratios, reverse=True)
 
         lines = self.screen.ocr_lines(image_path=image_path)
@@ -1627,6 +2060,16 @@ class ForwardFlow:
     def _left_selected_checkbox_y_ratios(self, rect: WindowRect, checkpoint_name: str) -> list[float]:
         image_path = self._save_window_checkpoint(checkpoint_name, rect)
         min_x, max_x = self._recipient_checkbox_x_bounds(rect)
+        checkbox_x_anchor = self._last_recipient_checkbox_x_ratio
+        if checkbox_x_anchor is not None:
+            # Recipient avatars can contain checkbox-sized blue squares.  The
+            # empty-checkbox scan has already established the column that we
+            # clicked, so verify selected checkboxes only around that column
+            # instead of letting a denser avatar-blue column win clustering.
+            anchored_min_x = max(min_x, checkbox_x_anchor - 0.012)
+            anchored_max_x = min(max_x, checkbox_x_anchor + 0.012)
+            if anchored_min_x <= anchored_max_x:
+                min_x, max_x = anchored_min_x, anchored_max_x
         min_y, max_y = self._recipient_checkbox_y_bounds(rect)
         scan_region = self._expanded_checkbox_scan_region(min_x, min_y, max_x, max_y)
         raw_points = list(
@@ -1643,12 +2086,15 @@ class ForwardFlow:
             max_y=max_y,
         )
         log.info(
-            "左侧已选会话复选框扫描：checkpoint=%s x_bounds=(%.3f, %.3f) y_bounds=(%.3f, %.3f) points=%s",
+            "左侧已选会话复选框扫描：checkpoint=%s x_anchor=%s x_bounds=(%.3f, %.3f) "
+            "y_bounds=(%.3f, %.3f) raw_points=%s points=%s",
             checkpoint_name,
+            round(checkbox_x_anchor, 3) if checkbox_x_anchor is not None else None,
             min_x,
             max_x,
             min_y,
             max_y,
+            [(round(x, 3), round(y, 3)) for x, y in raw_points],
             [(round(x, 3), round(y, 3)) for x, y in checkbox_points],
         )
         return sorted(

@@ -111,6 +111,7 @@ def select_aligned_checkbox_column(
     min_y: float,
     max_y: float,
     x_tolerance: float = 0.018,
+    tie_break: str = "leftmost",
 ) -> list[tuple[float, float]]:
     candidates = [
         (x_ratio, y_ratio)
@@ -135,14 +136,23 @@ def select_aligned_checkbox_column(
         else:
             matching.append(point)
 
-    source_cluster = max(
-        clusters,
-        key=lambda cluster: (
-            len({round(y, 3) for _x, y in cluster}),
+    def dedupe_row_count(cluster: list[tuple[float, float]]) -> int:
+        rows: list[float] = []
+        for _x, y in sorted(cluster, key=lambda item: item[1]):
+            if any(abs(y - existing_y) <= 0.012 for existing_y in rows):
+                continue
+            rows.append(y)
+        return len(rows)
+
+    def cluster_key(cluster: list[tuple[float, float]]) -> tuple[int, int, float]:
+        average_x = sum(x for x, _y in cluster) / len(cluster)
+        return (
+            dedupe_row_count(cluster),
             len(cluster),
-            -sum(x for x, _y in cluster) / len(cluster),
-        ),
-    )
+            average_x if tie_break == "rightmost" else -average_x,
+        )
+
+    source_cluster = max(clusters, key=cluster_key)
     deduped: list[tuple[float, float]] = []
     for point in sorted(source_cluster, key=lambda item: item[1]):
         if any(abs(point[1] - existing[1]) <= 0.012 for existing in deduped):

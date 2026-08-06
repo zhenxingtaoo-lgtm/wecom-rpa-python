@@ -10,6 +10,7 @@ from wecom_rpa.gui import (
     GuiRunOptions,
     WeComRpaApp,
     compute_gui_layout,
+    format_preflight_coordinate_log,
     inspect_run_setup,
     select_source_checkbox_column,
     validate_real_send_ready,
@@ -17,6 +18,7 @@ from wecom_rpa.gui import (
 )
 from wecom_rpa.forward_flow import FastPathState
 from wecom_rpa.forward_flow import FlowResult
+from wecom_rpa.screen import Region
 from wecom_rpa.wecom_window import WindowRect
 
 
@@ -150,6 +152,28 @@ class GuiSupportTest(unittest.TestCase):
             self.assertTrue(payload["preflight_cache"]["ready"])
             self.assertEqual(payload["preflight_cache"]["available_from_batch"], 1)
             self.assertEqual(payload["preflight_cache"]["final_send_button_ratio"], [0.56, 0.78])
+
+    def test_preflight_coordinate_log_uses_chinese_labels_and_absolute_points(self):
+        cache = FastPathState(
+            window_rect=WindowRect(0, 0, 1600, 900),
+            recipient_picker_rect=Region(left=420, top=90, width=1080, height=820),
+            recipient_checkbox_points_bottom_to_top=[(0.30, 0.80), (0.30, 0.70)],
+            recipient_scroll_drag=((790, 300), (790, 760)),
+            recipient_scroll_track=(790, 760),
+            final_send_button_ratio=(0.56, 0.78),
+            ready=True,
+            available_from_batch=1,
+        )
+
+        text = format_preflight_coordinate_log(cache, 1.23)
+        self.assertIn("left=420 top=90 width=1080 height=820", text)
+
+        self.assertIn("检查预演完成", text)
+        self.assertIn("第1个多选框", text)
+        self.assertIn("屏幕坐标=(480, 720)", text)
+        self.assertIn("滚动条拖拽开始坐标=(790, 300)", text)
+        self.assertIn("滚动条拖拽结束坐标=(790, 760)", text)
+        self.assertIn("最终发送按钮坐标=比例=(0.560, 0.780) 屏幕坐标=(896, 702)", text)
 
     def test_inspection_uses_gui_sentinel_parameters(self):
         with tempfile.TemporaryDirectory() as d:
