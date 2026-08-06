@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from .alerts import show_error_dialog
 from .config import AppConfig, build_runtime_config
 from .forward_flow import FastPathState, FlowResult, ForwardFlow
 from .powershell import terminate_active_powershell
@@ -780,7 +781,7 @@ class WeComRpaApp:
             self._bring_to_front()
             elapsed = time.monotonic() - start
             self._check_log(f"检查失败：elapsed={elapsed:.2f}s error={exc}", options.log_file if options else None)
-            messagebox.showerror("检查失败", str(exc))
+            show_error_dialog("检查失败", str(exc))
 
     def _render_summary(self, inspection: RunInspection, *, window_found: bool) -> None:
         sentinel = inspection.config.recipient_selection.sentinel
@@ -843,7 +844,7 @@ class WeComRpaApp:
         from tkinter import messagebox, simpledialog
 
         if not self.current_inspection or not self.last_check_passed:
-            messagebox.showerror("尚未检查", "请先点击“检查环境”。")
+            show_error_dialog("尚未检查", "请先点击“检查环境”。")
             return
         options = self._options_from_form()
         if options.dry_run:
@@ -852,14 +853,14 @@ class WeComRpaApp:
         else:
             typed = simpledialog.askstring("真实发送确认", "请输入 SEND 以启动真实发送：", show=None)
             if typed != "SEND":
-                messagebox.showerror("确认失败", "未输入 SEND，真实发送已取消。")
+                show_error_dialog("确认失败", "未输入 SEND，真实发送已取消。")
                 return
 
         try:
             snapshot_path = write_run_snapshot(options, self.current_inspection)
             self._append_log(f"本次运行参数快照已保存：{snapshot_path}")
         except Exception as exc:
-            messagebox.showerror("快照保存失败", f"无法保存本次运行参数快照，运行已取消：{exc}")
+            show_error_dialog("快照保存失败", f"无法保存本次运行参数快照，运行已取消：{exc}")
             return
 
         self.stop_controller = StopController(self.current_inspection.config.stop_hotkey)
@@ -1010,12 +1011,10 @@ class WeComRpaApp:
         self.run_started_at = None
 
     def _handle_failed(self, exc: Exception) -> None:
-        from tkinter import messagebox
-
         elapsed = self._current_run_elapsed()
         self._set_running(False)
         self.status_var.set("状态: 失败")
-        messagebox.showerror(
+        show_error_dialog(
             "运行失败",
             f"本次运行未完成。\n总耗时：{self._format_elapsed(elapsed)}\n\n错误信息：{exc}",
         )
