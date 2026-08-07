@@ -54,6 +54,55 @@ class OcrLine:
         return self.top + self.height // 2
 
 
+SOURCE_CHECKBOX_COLUMN_MIN_X = 0.14
+SOURCE_CHECKBOX_COLUMN_MAX_X = 0.50
+SOURCE_CHECKBOX_COLUMN_MIN_Y = 0.08
+SOURCE_CHECKBOX_COLUMN_MAX_Y = 0.82
+
+
+def window_coordinate_scales(rect: Any, image_size: tuple[int, int]) -> list[float]:
+    image_width, image_height = image_size
+    if image_width <= 0 or image_height <= 0 or rect.width <= 0 or rect.height <= 0:
+        return []
+
+    scales: list[float] = []
+
+    def add_scale(scale: float) -> None:
+        if scale <= 0 or scale < 0.40 or scale > 4.00:
+            return
+        if any(abs(scale - existing) <= 0.02 for existing in scales):
+            return
+        scales.append(scale)
+
+    add_scale(1.0)
+    add_scale(image_width / rect.width)
+    add_scale(image_height / rect.height)
+    return scales
+
+
+def fullscreen_point_to_window_ratio(
+    abs_x: float,
+    abs_y: float,
+    rect: Any,
+    image_size: tuple[int, int],
+    *,
+    x_range: tuple[float, float] = (0.0, 1.0),
+    y_range: tuple[float, float] = (0.0, 1.0),
+) -> tuple[float, float] | None:
+    for scale in window_coordinate_scales(rect, image_size):
+        scaled_left = rect.left * scale
+        scaled_top = rect.top * scale
+        scaled_width = rect.width * scale
+        scaled_height = rect.height * scale
+        if not (scaled_left <= abs_x <= scaled_left + scaled_width and scaled_top <= abs_y <= scaled_top + scaled_height):
+            continue
+        local_x = (abs_x - scaled_left) / scaled_width
+        local_y = (abs_y - scaled_top) / scaled_height
+        if x_range[0] <= local_x <= x_range[1] and y_range[0] <= local_y <= y_range[1]:
+            return (local_x, local_y)
+    return None
+
+
 def select_aligned_checkbox_column(
     points: list[tuple[float, float]],
     *,
@@ -62,6 +111,7 @@ def select_aligned_checkbox_column(
     min_y: float,
     max_y: float,
     x_tolerance: float = 0.018,
+    tie_break: str = "leftmost",
 ) -> list[tuple[float, float]]:
     candidates = [
         (x_ratio, y_ratio)
@@ -86,14 +136,23 @@ def select_aligned_checkbox_column(
         else:
             matching.append(point)
 
-    source_cluster = max(
-        clusters,
-        key=lambda cluster: (
-            len({round(y, 3) for _x, y in cluster}),
+    def dedupe_row_count(cluster: list[tuple[float, float]]) -> int:
+        rows: list[float] = []
+        for _x, y in sorted(cluster, key=lambda item: item[1]):
+            if any(abs(y - existing_y) <= 0.012 for existing_y in rows):
+                continue
+            rows.append(y)
+        return len(rows)
+
+    def cluster_key(cluster: list[tuple[float, float]]) -> tuple[int, int, float]:
+        average_x = sum(x for x, _y in cluster) / len(cluster)
+        return (
+            dedupe_row_count(cluster),
             len(cluster),
-            -sum(x for x, _y in cluster) / len(cluster),
-        ),
-    )
+            average_x if tie_break == "rightmost" else -average_x,
+        )
+
+    source_cluster = max(clusters, key=cluster_key)
     deduped: list[tuple[float, float]] = []
     for point in sorted(source_cluster, key=lambda item: item[1]):
         if any(abs(point[1] - existing[1]) <= 0.012 for existing in deduped):

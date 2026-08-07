@@ -12,12 +12,22 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from .alerts import show_error_dialog
 from .config import AppConfig, build_runtime_config
-from .forward_flow import FlowResult, ForwardFlow
+from .forward_flow import FastPathState, FlowResult, ForwardFlow
 from .powershell import terminate_active_powershell
 from .safety import StopController
-from .screen import ScreenInspector, select_aligned_checkbox_column
-from .wecom_window import WeComWindow
+from .screen import (
+    SOURCE_CHECKBOX_COLUMN_MAX_X,
+    SOURCE_CHECKBOX_COLUMN_MAX_Y,
+    SOURCE_CHECKBOX_COLUMN_MIN_X,
+    SOURCE_CHECKBOX_COLUMN_MIN_Y,
+    Region,
+    ScreenInspector,
+    fullscreen_point_to_window_ratio,
+    select_aligned_checkbox_column,
+)
+from .wecom_window import WeComWindow, WindowRect
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +53,7 @@ class RunInspection:
     batch_count: int
     ocr_warning: str | None = None
     source_check: SourceSelectionInspection | None = None
+    preflight_cache: FastPathState | None = None
 
 
 @dataclass(frozen=True)
@@ -53,6 +64,51 @@ class SourceSelectionInspection:
     matched_count: int
     points: list[tuple[float, float]]
     forward_button_ratio: tuple[float, float] | None = None
+
+
+def _format_ratio_point_with_abs(
+    rect: WindowRect | None,
+    point: tuple[float, float],
+) -> str:
+    x_ratio, y_ratio = point
+    if rect is None:
+        return f"比例=({x_ratio:.3f}, {y_ratio:.3f})"
+    abs_x, abs_y = rect.relative_point(x_ratio, y_ratio)
+    return f"比例=({x_ratio:.3f}, {y_ratio:.3f}) 屏幕坐标=({abs_x}, {abs_y})"
+
+
+def _format_region(region: Region | None) -> str:
+    if region is None:
+        return "未识别"
+    return f"left={region.left} top={region.top} width={region.width} height={region.height}"
+
+
+def format_preflight_coordinate_log(cache: FastPathState, elapsed: float) -> str:
+    rect = cache.window_rect
+    checkbox_parts = [
+        f"第{index}个多选框[{_format_ratio_point_with_abs(rect, point)}]"
+        for index, point in enumerate(cache.recipient_checkbox_points_bottom_to_top or [], start=1)
+    ]
+    drag_start = None
+    drag_end = None
+    if cache.recipient_scroll_drag is not None:
+        drag_start, drag_end = cache.recipient_scroll_drag
+    final_button = (
+        _format_ratio_point_with_abs(rect, cache.final_send_button_ratio)
+        if cache.final_send_button_ratio is not None
+        else "未识别"
+    )
+    picker_rect_text = f"会话选择框坐标={_format_region(cache.recipient_picker_rect)} "
+    return (
+        picker_rect_text +
+        "检查预演完成："
+        f"耗时={elapsed:.2f}秒 "
+        f"9个多选框坐标={checkbox_parts} "
+        f"滚动条拖拽开始坐标={drag_start} "
+        f"滚动条拖拽结束坐标={drag_end} "
+        f"滚动条底部参考坐标={cache.recipient_scroll_track} "
+        f"最终发送按钮坐标={final_button}"
+    )
 
 
 @dataclass(frozen=True)
@@ -145,6 +201,7 @@ def write_run_snapshot(options: GuiRunOptions, inspection: RunInspection) -> Pat
             **asdict(inspection.source_check),
             "screenshot": str(inspection.source_check.screenshot),
         }
+    preflight_cache = asdict(inspection.preflight_cache) if inspection.preflight_cache is not None else None
     payload = {
         "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "log_file": str(options.log_file.resolve()),
@@ -153,6 +210,7 @@ def write_run_snapshot(options: GuiRunOptions, inspection: RunInspection) -> Pat
         "batch_count": inspection.batch_count,
         "effective_config": asdict(inspection.config),
         "source_check": source_check,
+        "preflight_cache": preflight_cache,
     }
     target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     log.info("本次运行参数快照已保存：%s", target)
@@ -205,7 +263,8 @@ def inspect_source_selection(config: AppConfig, screenshot_dir: Path, rect: Any)
     fullscreen_points = [
         (x_ratio, y_ratio)
         for x_ratio, y_ratio in fullscreen_raw_points
-        if 0.18 <= x_ratio <= 0.50 and 0.08 <= y_ratio <= 0.82
+        if SOURCE_CHECKBOX_COLUMN_MIN_X <= x_ratio <= SOURCE_CHECKBOX_COLUMN_MAX_X
+        and SOURCE_CHECKBOX_COLUMN_MIN_Y <= y_ratio <= SOURCE_CHECKBOX_COLUMN_MAX_Y
     ]
     points = select_source_checkbox_column(converted_points)
     fullscreen_source_points = select_source_checkbox_column(fullscreen_points)
@@ -230,10 +289,10 @@ def select_source_checkbox_column(
 ) -> list[tuple[float, float]]:
     return select_aligned_checkbox_column(
         points,
-        min_x=0.18,
-        max_x=0.50,
-        min_y=0.08,
-        max_y=0.82,
+        min_x=SOURCE_CHECKBOX_COLUMN_MIN_X,
+        max_x=SOURCE_CHECKBOX_COLUMN_MAX_X,
+        min_y=SOURCE_CHECKBOX_COLUMN_MIN_Y,
+        max_y=SOURCE_CHECKBOX_COLUMN_MAX_Y,
         x_tolerance=x_tolerance,
     )
 
@@ -256,9 +315,16 @@ def detect_forward_button_ratio(inspector: ScreenInspector, image_path: Path, re
             continue
         center_x = line.left + line.width / 2.0
         center_y = line.top + line.height / 2.0
-        local_x = (center_x - rect.left) / rect.width
-        local_y = (center_y - rect.top) / rect.height
-        if 0.15 <= local_x <= 0.85 and 0.70 <= local_y <= 0.98:
+        mapped = fullscreen_point_to_window_ratio(
+            center_x,
+            center_y,
+            rect,
+            image_size,
+            x_range=(0.15, 0.85),
+            y_range=(0.70, 0.98),
+        )
+        if mapped is not None:
+            local_x, local_y = mapped
             candidates.append((local_x, local_y, line.text))
 
     if not candidates:
@@ -285,34 +351,28 @@ def convert_fullscreen_checkbox_ratios_to_window(
         return []
     image_width, image_height = image_size
     converted: list[tuple[float, float]] = []
-    scales = {1.0}
-    if image_width > rect.width * 1.25:
-        scales.add(image_width / rect.width)
-    if image_height > rect.height * 1.25:
-        scales.add(image_height / rect.height)
     raw_points = inspector.filter_source_checkbox_marker_points(
         image_path,
         list(inspector.find_selected_checkbox_ratios(image_path)),
     )
     seen: set[tuple[int, int]] = set()
-    for scale in scales:
-        scaled_left = rect.left * scale
-        scaled_top = rect.top * scale
-        scaled_width = rect.width * scale
-        scaled_height = rect.height * scale
-        for x_ratio, y_ratio in raw_points:
-            abs_x = x_ratio * image_width
-            abs_y = y_ratio * image_height
-            if not (scaled_left <= abs_x <= scaled_left + scaled_width and scaled_top <= abs_y <= scaled_top + scaled_height):
-                continue
-            local_x = (abs_x - scaled_left) / scaled_width
-            local_y = (abs_y - scaled_top) / scaled_height
-            if 0.18 <= local_x <= 0.50 and 0.08 <= local_y <= 0.82:
-                key = (round(local_x * 10000), round(local_y * 10000))
-                if key in seen:
-                    continue
-                seen.add(key)
-                converted.append((local_x, local_y))
+    for x_ratio, y_ratio in raw_points:
+        mapped = fullscreen_point_to_window_ratio(
+            x_ratio * image_width,
+            y_ratio * image_height,
+            rect,
+            image_size,
+            x_range=(SOURCE_CHECKBOX_COLUMN_MIN_X, SOURCE_CHECKBOX_COLUMN_MAX_X),
+            y_range=(SOURCE_CHECKBOX_COLUMN_MIN_Y, SOURCE_CHECKBOX_COLUMN_MAX_Y),
+        )
+        if mapped is None:
+            continue
+        local_x, local_y = mapped
+        key = (round(local_x * 10000), round(local_y * 10000))
+        if key in seen:
+            continue
+        seen.add(key)
+        converted.append((local_x, local_y))
     return converted
 
 
@@ -682,6 +742,26 @@ class WeComRpaApp:
                     "检查失败：未识别到“逐条转发”按钮，不能继续执行。"
                     f" screenshot={source_check.screenshot}"
                 )
+            preflight_count = min(inspection.config.batch_size, inspection.send_count)
+            self._check_log(
+                "开始检查预演：按正式流程打开会话选择框、滚动到底部、勾选本批会话并识别发送按钮"
+                f" count={preflight_count}",
+                options.log_file,
+            )
+            preflight_flow = ForwardFlow(
+                inspection.config,
+                screenshot_dir=str(options.screenshot_dir),
+                yes=True,
+                real_send_allowed=False,
+                install_stop_hotkey=False,
+            )
+            preflight_started = time.monotonic()
+            preflight_cache = preflight_flow.preflight_first_batch_until_final_send_button(preflight_count)
+            inspection = replace(inspection, preflight_cache=preflight_cache)
+            self._check_log(
+                format_preflight_coordinate_log(preflight_cache, time.monotonic() - preflight_started),
+                options.log_file,
+            )
             self.current_inspection = inspection
             self.last_check_passed = True
             self._render_summary(inspection, window_found=window_found)
@@ -701,7 +781,7 @@ class WeComRpaApp:
             self._bring_to_front()
             elapsed = time.monotonic() - start
             self._check_log(f"检查失败：elapsed={elapsed:.2f}s error={exc}", options.log_file if options else None)
-            messagebox.showerror("检查失败", str(exc))
+            show_error_dialog("检查失败", str(exc))
 
     def _render_summary(self, inspection: RunInspection, *, window_found: bool) -> None:
         sentinel = inspection.config.recipient_selection.sentinel
@@ -764,7 +844,7 @@ class WeComRpaApp:
         from tkinter import messagebox, simpledialog
 
         if not self.current_inspection or not self.last_check_passed:
-            messagebox.showerror("尚未检查", "请先点击“检查环境”。")
+            show_error_dialog("尚未检查", "请先点击“检查环境”。")
             return
         options = self._options_from_form()
         if options.dry_run:
@@ -773,19 +853,21 @@ class WeComRpaApp:
         else:
             typed = simpledialog.askstring("真实发送确认", "请输入 SEND 以启动真实发送：", show=None)
             if typed != "SEND":
-                messagebox.showerror("确认失败", "未输入 SEND，真实发送已取消。")
+                show_error_dialog("确认失败", "未输入 SEND，真实发送已取消。")
                 return
 
         try:
             snapshot_path = write_run_snapshot(options, self.current_inspection)
             self._append_log(f"本次运行参数快照已保存：{snapshot_path}")
         except Exception as exc:
-            messagebox.showerror("快照保存失败", f"无法保存本次运行参数快照，运行已取消：{exc}")
+            show_error_dialog("快照保存失败", f"无法保存本次运行参数快照，运行已取消：{exc}")
             return
 
         self.stop_controller = StopController(self.current_inspection.config.stop_hotkey)
+        self.stop_controller.add_callback(terminate_active_powershell)
         self.run_started_at = time.monotonic()
         self._set_running(True)
+        self.progress_var.set(f"运行中；如需立即停止，请按 {self.current_inspection.config.stop_hotkey}")
         self.worker = threading.Thread(target=self._run_worker, args=(options, self.current_inspection, self.stop_controller), daemon=True)
         self.worker.start()
 
@@ -801,16 +883,18 @@ class WeComRpaApp:
                 [round(y, 3) for y in inspection.config.source_selection.checkbox_y_ratios],
                 inspection.send_count,
             )
-            result = ForwardFlow(
+            flow = ForwardFlow(
                 inspection.config,
                 screenshot_dir=str(options.screenshot_dir),
                 yes=False,
                 real_send_allowed=not inspection.config.dry_run,
                 stop_controller=stop_controller,
-                install_stop_hotkey=False,
+                install_stop_hotkey=True,
                 confirm_callback=self._confirm_from_worker,
                 progress_callback=lambda event: self.ui_queue.put(("progress", event)),
-            ).run(inspection.send_count)
+            )
+            flow.apply_preflight_cache(inspection.preflight_cache)
+            result = flow.run(inspection.send_count)
             self.ui_queue.put(("finished", result))
         except Exception as exc:
             self.ui_queue.put(("failed", exc))
@@ -927,12 +1011,10 @@ class WeComRpaApp:
         self.run_started_at = None
 
     def _handle_failed(self, exc: Exception) -> None:
-        from tkinter import messagebox
-
         elapsed = self._current_run_elapsed()
         self._set_running(False)
         self.status_var.set("状态: 失败")
-        messagebox.showerror(
+        show_error_dialog(
             "运行失败",
             f"本次运行未完成。\n总耗时：{self._format_elapsed(elapsed)}\n\n错误信息：{exc}",
         )

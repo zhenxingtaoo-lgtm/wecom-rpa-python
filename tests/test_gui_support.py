@@ -2,6 +2,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from dataclasses import replace
 import json
 from unittest import mock
 
@@ -9,11 +10,16 @@ from wecom_rpa.gui import (
     GuiRunOptions,
     WeComRpaApp,
     compute_gui_layout,
+    format_preflight_coordinate_log,
     inspect_run_setup,
     select_source_checkbox_column,
     validate_real_send_ready,
     write_run_snapshot,
 )
+from wecom_rpa.forward_flow import FastPathState
+from wecom_rpa.forward_flow import FlowResult
+from wecom_rpa.screen import Region
+from wecom_rpa.wecom_window import WindowRect
 
 
 class GuiSupportTest(unittest.TestCase):
@@ -32,6 +38,31 @@ class GuiSupportTest(unittest.TestCase):
         app.stop_controller.request_stop.assert_called_once_with()
         app.stop_button.configure.assert_called_once_with(state="disabled")
         terminate.assert_called_once_with()
+
+    def test_run_worker_enables_global_stop_hotkey(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            app = WeComRpaApp.__new__(WeComRpaApp)
+            app.ui_queue = mock.Mock()
+            app._install_logging = mock.Mock()
+            app._confirm_from_worker = mock.Mock(return_value=True)
+            app.queue_log_handler = None
+            app.file_log_handler = None
+            options = GuiRunOptions(
+                log_file=root / "logs" / "wecom_rpa.log",
+                screenshot_dir=root / "screenshots",
+                send_count=1,
+            )
+            inspection = inspect_run_setup(options)
+            stop_controller = mock.Mock()
+            flow_instance = mock.Mock()
+            flow_instance.run.return_value = FlowResult("stopped", {"planned": 1, "sent": 0})
+
+            with mock.patch("wecom_rpa.gui.ForwardFlow", return_value=flow_instance) as flow_cls:
+                app._run_worker(options, inspection, stop_controller)
+
+            self.assertTrue(flow_cls.call_args.kwargs["install_stop_hotkey"])
+            flow_instance.apply_preflight_cache.assert_called_once_with(inspection.preflight_cache)
 
     def test_validate_real_send_ready_requires_both_confirmations(self):
         validate_real_send_ready(dry_run=True, confirm_send=False, confirm_review=False)
@@ -94,6 +125,55 @@ class GuiSupportTest(unittest.TestCase):
             self.assertEqual(payload["batch_count"], 2)
             self.assertEqual(payload["effective_config"]["batch_size"], 9)
             self.assertNotIn("config_path", payload)
+
+    def test_run_snapshot_records_preflight_cache(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            options = GuiRunOptions(
+                log_file=root / "logs" / "wecom_rpa.log",
+                screenshot_dir=root / "screenshots",
+                send_count=9,
+            )
+            inspection = replace(
+                inspect_run_setup(options),
+                preflight_cache=FastPathState(
+                    window_rect=WindowRect(0, 0, 1600, 900),
+                    recipient_checkbox_points_bottom_to_top=[(0.30, 0.80)],
+                    recipient_scroll_drag=((790, 300), (790, 760)),
+                    recipient_scroll_track=(790, 760),
+                    final_send_button_ratio=(0.56, 0.78),
+                    ready=True,
+                    available_from_batch=1,
+                ),
+            )
+            snapshot = write_run_snapshot(options, inspection)
+            payload = json.loads(snapshot.read_text(encoding="utf-8"))
+
+            self.assertTrue(payload["preflight_cache"]["ready"])
+            self.assertEqual(payload["preflight_cache"]["available_from_batch"], 1)
+            self.assertEqual(payload["preflight_cache"]["final_send_button_ratio"], [0.56, 0.78])
+
+    def test_preflight_coordinate_log_uses_chinese_labels_and_absolute_points(self):
+        cache = FastPathState(
+            window_rect=WindowRect(0, 0, 1600, 900),
+            recipient_picker_rect=Region(left=420, top=90, width=1080, height=820),
+            recipient_checkbox_points_bottom_to_top=[(0.30, 0.80), (0.30, 0.70)],
+            recipient_scroll_drag=((790, 300), (790, 760)),
+            recipient_scroll_track=(790, 760),
+            final_send_button_ratio=(0.56, 0.78),
+            ready=True,
+            available_from_batch=1,
+        )
+
+        text = format_preflight_coordinate_log(cache, 1.23)
+        self.assertIn("left=420 top=90 width=1080 height=820", text)
+
+        self.assertIn("检查预演完成", text)
+        self.assertIn("第1个多选框", text)
+        self.assertIn("屏幕坐标=(480, 720)", text)
+        self.assertIn("滚动条拖拽开始坐标=(790, 300)", text)
+        self.assertIn("滚动条拖拽结束坐标=(790, 760)", text)
+        self.assertIn("最终发送按钮坐标=比例=(0.560, 0.780) 屏幕坐标=(896, 702)", text)
 
     def test_inspection_uses_gui_sentinel_parameters(self):
         with tempfile.TemporaryDirectory() as d:
